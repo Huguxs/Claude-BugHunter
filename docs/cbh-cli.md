@@ -122,7 +122,7 @@ Pipeline (in order):
 
 1. **Passive subdomain enumeration** — `crt.sh` certificate transparency (always, no key needed) + `subfinder` (if installed) merged + deduplicated.
 2. **DNS resolution** — stdlib `socket.getaddrinfo()` to dodge the `dnsx` segfault issue documented on macOS arm64 (per `web2-recon` Operator Notes).
-3. **HTTP probe** — concurrent (10 threads) `urllib.request` → status code, Server header, X-Powered-By, X-Drupal-Cache, and `<title>` extraction.
+3. **HTTP probe** — concurrent (10 threads) `urllib.request` → status code, Server header, X-Powered-By, X-Drupal-Cache, and `<title>` extraction. Redirects are recorded by their first response status without requesting the destination.
 4. **Summary** — writes `recon/<target>/RECON_SUMMARY.md` with the live-host table and a "Suggested next moves" pointer to `classify`.
 
 Outputs:
@@ -182,11 +182,13 @@ The gate matches keyword signals per question; absence-of-evidence is treated as
 - Q6 missing "leaked / exfiltrated / oob callback" → impact is "technically possible" only
 - Q7 hit on "self-xss / rate-limit only / clickjacking" → automatic KILL
 
-### `cbh report <finding.md> [--platform h1|bugcrowd|intigriti|immunefi] [--out path]`
+### `cbh report <finding.md> [--platform h1|hackerone|bugcrowd|intigriti|immunefi] [--reporter handle] [--out path]`
 
 ```bash
 cbh report findings/idor-2026-05-15.md --platform bugcrowd --out submissions/h1-draft.md
 ```
+
+`--platform hackerone` is an alias of `h1`. The **Reporter** line comes from `--reporter`, else the `CBH_REPORTER` environment variable, else a `(your handle)` placeholder — it never uses your OS login name.
 
 Parses the finding's YAML frontmatter + section headings, emits a platform-specific draft:
 

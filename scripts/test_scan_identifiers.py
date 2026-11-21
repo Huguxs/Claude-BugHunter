@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-check for scan_identifiers.py. Stdlib only, no network, no git.
+"""Self-check for scan_identifiers.py. Stdlib and local Git only. No network.
 
 Run: python3 scripts/test_scan_identifiers.py   (exit 0 = pass)
 
@@ -12,6 +12,7 @@ asserts the three behaviors that matter:
 import hashlib
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -51,11 +52,33 @@ def main():
         assert mod.main([leak]) == 1, "expected hit (exit 1) on planted identifier"
         # 2. clean file passes
         assert mod.main([clean]) == 0, "expected clean (exit 0) on benign file"
+        # The staged snapshot can differ from the current working tree.
+        subprocess.run(["git", "init", "-q", tmp], check=True)
+        subprocess.run(["git", "-C", tmp, "add", "--", leak], check=True)
+        with open(leak, "w", encoding="utf-8") as fh:
+            fh.write("Working copy is clean.\n")
+        assert mod.main([]) == 0, "working-tree scan should see the clean file"
+        assert mod.main(["--staged"]) == 1, "staged scan must detect the staged identifier"
+
+        subprocess.run(["git", "-C", tmp, "add", "--", leak], check=True)
+        with open(leak, "w", encoding="utf-8") as fh:
+            fh.write("AcmeCorp only in the working copy.\n")
+        assert mod.main(["--staged"]) == 0, "unstaged identifiers must not block a clean commit"
+
         # 3. case-insensitive: "ACMECORP" also caught
         loud = os.path.join(tmp, "loud.md")
         with open(loud, "w") as fh:
             fh.write("ACMECORP everywhere\n")
         assert mod.main([loud]) == 1, "expected case-insensitive hit"
+
+        # Test default tracked-path discovery; Git quotes non-ASCII by default.
+        unicode_leak = os.path.join(tmp, "notes-café.md")
+        with open(unicode_leak, "w", encoding="utf-8") as fh:
+            fh.write("An AcmeCorp synthetic fixture.\n")
+        subprocess.run(["git", "init", "-q", tmp], check=True)
+        subprocess.run(["git", "-C", tmp, "config", "core.quotePath", "true"], check=True)
+        subprocess.run(["git", "-C", tmp, "add", "--", unicode_leak], check=True)
+        assert mod.main([]) == 1, "expected tracked scan to inspect Unicode filename"
 
         # 4. fail-closed on empty denylist
         with open(deny, "w") as fh:

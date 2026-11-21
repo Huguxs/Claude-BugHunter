@@ -26,6 +26,7 @@ from scope import Scope            # noqa: E402
 from state import Engagement       # noqa: E402
 import agent as A                  # noqa: E402
 import memory                     # noqa: E402  (autopilot ledger; import-isolated)
+import closure                    # noqa: E402  (coverage ledger / closure gate)
 
 # deterministic priority by class (impact-ish); used by rank. Keep in sync with
 # skill_map.CLASS_SKILL so every routed class gets a sensible (non-default) weight.
@@ -52,13 +53,14 @@ class Engine:
     def __init__(self, scope_path, base, model, max_hunts, max_turns, timeout, mock=False,
                  allow_intrusive=False, parallel=3, expand=False, use_memory=False):
         self.scope = Scope.load(scope_path)
-        self.eng = Engagement(base, self.scope.name)
+        state_base = os.path.join(base, ".mock") if mock else base
+        self.eng = Engagement(state_base, self.scope.name)
         self.model, self.max_hunts = model, max_hunts
         self.max_turns, self.timeout, self.mock = max_turns, timeout, mock
         self.allow_intrusive = allow_intrusive
         self.expand = expand
         self.parallel = max(1, parallel)
-        self.use_memory = use_memory
+        self.use_memory = use_memory and not mock
         self.eng.log(f"engine start | scope={self.scope.name} in={self.scope.in_scope} "
                      f"out={self.scope.out_of_scope} seeds={self.scope.seeds} mock={mock} "
                      f"intrusive={'ALLOWED' if allow_intrusive else 'READ-ONLY (default)'}")
@@ -145,7 +147,7 @@ class Engine:
         for t in tech:
             self.eng.log(f"recon: service {t.get('host')} [{t.get('status')}] · {', '.join(t.get('tech', [])) or 'tech?'}")
         plat = R.platform_recon(self.scope, log=self.eng.log)        # .well-known / Firebase / OAuth / robots
-        api = R.openapi_recon(self.scope, log=self.eng.log)          # OpenAPI schema -> categorized + auth-sweep
+        api = R.openapi_recon(self.scope, log=self.eng.log, allow_intrusive=self.allow_intrusive)          # OpenAPI schema -> categorized + auth-sweep
         endpoints, oos = R.spa_recon(self.scope, log=self.eng.log)   # current API endpoints + JS secrets
         params = R.gather_params(self.scope, log=self.eng.log)       # all input parameters (gau historical)
         # categorize every (endpoint | param) into its applicable attack classes, expand to work units
@@ -207,7 +209,7 @@ class Engine:
                              f"`{SM.probe_for(c, url, param)}`")
             lines.append("")
         path = os.path.join(self.eng.dir, "arsenal.md")
-        open(path, "w").write("\n".join(lines))
+        open(path, "w", encoding="utf-8").write("\n".join(lines))
         self.eng.log(f"map: wrote arsenal map -> {path}  ← focus your 20% here (or run --hunt to auto-test)")
 
     # ---------------- parallel runner ----------------
@@ -217,7 +219,12 @@ class Engine:
         state writes, so there's no race on state.json."""
         if self.parallel <= 1 or len(items) <= 1:
             for it in items:
-                yield it, fn(it)
+                try:
+                    result = fn(it)
+                except Exception as e:
+                    self.eng.log(f"  worker error on {it.get('url')}: {e}")
+                    result = {}
+                yield it, result
             return
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=self.parallel) as ex:
@@ -243,7 +250,8 @@ class Engine:
         for it in wl:
             if not self.scope.in_scope_host(it["url"]):     # belt-and-suspenders scope gate
                 self.eng.log(f"hunt: REFUSING out-of-scope {it['url']} ({self.scope.reject_reason(it['url'])})")
-                self.eng.mark_tested(it)
+                self.eng.mark_tested(it, coverage="out_of_scope",
+                                     note=self.scope.reject_reason(it["url"]))
                 continue
             if self.use_memory:
                 d = memory.skip_decision(memory._host(it["url"]), tech, it)
@@ -252,7 +260,7 @@ class Engine:
                                  f"{it.get('vuln_class')}@{it['url']}")
                     if d["carry"]:
                         self.eng.confirm(d["carry"], d["carry"]["verdict"])
-                    self.eng.mark_tested(it)
+                    self.eng.mark_tested(it, coverage="finding" if d["carry"] else "clean")
                     continue
             todo.append(it)
         self.eng.log(f"hunt: testing {len(todo)} item(s), {self.parallel} at a time")
@@ -265,19 +273,21 @@ class Engine:
                 reason = (f or {}).get("error", "worker-exception")
                 self.eng.log(f"hunt: ⚠ NOT tested ({reason}) — left on worklist: "
                              f"{it.get('vuln_class')}@{it.get('url')}")
+                # blocked is NOT covered — it ships as a caveat until it is retried
+                self.eng.record_coverage(it, "blocked", reason)
                 continue
-            self.eng.mark_tested(it)
             if f.get("vulnerable"):
                 oos = self._scope_audit(f)
                 cand = {"url": it["url"], "param": it.get("param", ""), "vuln_class": it.get("vuln_class"),
                         "severity": f.get("severity", "unknown"), "evidence": f.get("evidence", ""),
                         "request": f.get("request", ""), "proof_note": f.get("proof_note", ""),
                         "scope_warning": oos or None}
-                self.eng.add_candidate(cand)
+                self.eng.mark_tested(it, candidate=cand, coverage="finding")
                 self.eng.log((f"hunt: ⚠ CANDIDATE {cand['vuln_class']} @ {it['url']} — PoC touched OUT-OF-SCOPE "
                               f"host(s): {', '.join(oos)} (flagged)") if oos
                              else f"hunt: CANDIDATE {cand['vuln_class']} @ {it['url']}")
             else:
+                self.eng.mark_tested(it, coverage="clean")
                 self.eng.log(f"hunt: nothing on {it.get('vuln_class')}@{it['url']}")
 
     def _hunt_agent(self, it):
@@ -306,31 +316,45 @@ class Engine:
             return {"vulnerable": False, "errored": True, "error": r["error"],
                     "rate_limited": r["error"] == "rate-limited"}
         verdict = A.extract_json(r["result"])
-        if verdict is None:
-            # Agent ran but produced no parseable verdict — inconclusive, not a real negative.
-            self.eng.log(f"hunt: no parseable verdict for {it['url']} — inconclusive, left for retry")
+        if not isinstance(verdict, dict) or not isinstance(verdict.get("vulnerable"), bool):
+            # Agent ran but produced no usable verdict — inconclusive, not a real negative.
+            self.eng.log(f"hunt: no usable verdict for {it['url']} — inconclusive, left for retry")
             return {"vulnerable": False, "errored": True, "error": "no-verdict"}
         return verdict
 
     # ---------------- validate ----------------
     def validate(self):
         self.eng.set_phase("validate")
-        pending = [c for c in self.eng.state["candidates"]
-                   if not any(cf.get("url") == c["url"] and cf.get("vuln_class") == c["vuln_class"]
-                              for cf in self.eng.state["confirmed"])]
-        self.eng.log(f"validate: {len(pending)} candidate(s) to adversarially verify, {self.parallel} at a time")
-        for c, v in self._run_parallel(self._validate_agent, pending):
-            if v and v.get("real"):
+        confirmed_keys = {self.eng._key(finding) for finding in self.eng.state["confirmed"]}
+        finished_keys = confirmed_keys | set(self.eng.state["rejected"])
+        pending = [candidate for candidate in self.eng.state["candidates"]
+                   if self.eng._key(candidate) not in finished_keys]
+        in_scope = []
+        for candidate in pending:
+            reason = self.scope.reject_reason(candidate["url"])
+            if reason is not None:
+                self.eng.log(f"validate: REFUSING {candidate['url']} ({reason})")
+                continue
+            in_scope.append(candidate)
+        self.eng.log(f"validate: {len(in_scope)} candidate(s) to adversarially verify, {self.parallel} at a time")
+        for c, v in self._run_parallel(self._validate_agent, in_scope):
+            if not v or v.get("errored"):
+                self.eng.log(f"validate: inconclusive {c['vuln_class']} @ {c['url']} — "
+                             f"{(v or {}).get('reason', 'worker error')}")
+            elif v.get("real"):
                 if v.get("severity"):
                     c["severity"] = v["severity"]  # use the validator's CALIBRATED severity, not the hunt's
                 self.eng.confirm(c, v)
-                try:
-                    memory.record_finding(self.scope.name, memory._host(c["url"]), self._tech(), c, v)
-                except Exception as e:
-                    self.eng.log(f"memory: capture skipped ({e})")
+                if not self.mock:
+                    try:
+                        memory.record_finding(self.scope.name, memory._host(c["url"]), self._tech(), c, v)
+                    except Exception as e:
+                        self.eng.log(f"memory: capture skipped ({e})")
                 self.eng.log(f"validate: CONFIRMED {c['vuln_class']} @ {c['url']} ({v.get('severity','')})"
                              + (f" ⚠ scope-flagged: {', '.join(c['scope_warning'])}" if c.get('scope_warning') else ''))
             else:
+                self.eng.state["rejected"].append(self.eng._key(c))
+                self.eng.save()
                 self.eng.log(f"validate: rejected (false positive) {c['vuln_class']} @ {c['url']} — "
                              f"{(v or {}).get('reason', 'no verdict')}")
 
@@ -349,18 +373,23 @@ class Engine:
         r = A.run_agent(task, model=self.model, max_turns=self.max_turns, timeout=self.timeout)
         if r.get("error"):
             self.eng.log(f"validate agent error: {r['error']}")
-            return {"real": False, "reason": f"verify error: {r['error']}"}
-        return A.extract_json(r["result"]) or {"real": False, "reason": "no verdict"}
+            return {"real": False, "reason": f"verify error: {r['error']}", "errored": True}
+        verdict = A.extract_json(r["result"])
+        if not isinstance(verdict, dict) or not isinstance(verdict.get("real"), bool):
+            return {"real": False, "reason": "no usable verdict", "errored": True}
+        return verdict
 
     # ---------------- report ----------------
     def report(self):
         self.eng.set_phase("report")
         c = self.eng.state["confirmed"]
         s = self.eng.summary()
+        cov = closure.evaluate(self.eng.state)
         lines = [f"# Engagement report — {self.scope.name}", "",
                  f"In scope: `{'`, `'.join(self.scope.in_scope)}`  ",
                  f"Surface mapped: {s['surface']} · tested: {s['tested']} · "
-                 f"candidates: {s['candidates']} · **confirmed: {s['confirmed']}**", ""]
+                 f"candidates: {s['candidates']} · **confirmed: {s['confirmed']}**  ",
+                 f"Coverage: **{'complete' if cov['clean'] else 'INCOMPLETE'}** — {cov['reason']}", ""]
         if not c:
             lines += ["No confirmed findings.", ""]
         flagged = [f for f in c if f.get("scope_warning")]
@@ -379,13 +408,16 @@ class Engine:
                       f"- **Request:** `{f.get('request','')}`",
                       f"- **Verifier:** {f.get('verdict',{}).get('reason','')}", ""]
             lines += block
+        # Coverage caveats are generated from the ledger, never hand-written.
+        lines += ["", closure.render_caveats(self.eng.state, cov)]
         path = os.path.join(self.eng.dir, "report.md")
-        open(path, "w").write("\n".join(lines))
+        open(path, "w", encoding="utf-8").write("\n".join(lines))
         self.eng.log(f"report: wrote {len(c)} confirmed finding(s) -> {path}")
-        try:
-            memory.record_run(self.scope.name, self._tech(), self.eng.state["tested"], self.eng.state["confirmed"])
-        except Exception as e:
-            self.eng.log(f"memory: rollup skipped ({e})")
+        if not self.mock:
+            try:
+                memory.record_run(self.scope.name, self._tech(), self.eng.state["tested"], self.eng.state["confirmed"])
+            except Exception as e:
+                self.eng.log(f"memory: rollup skipped ({e})")
         return path
 
     def run(self, phases):
@@ -417,6 +449,13 @@ MOCK_VALIDATE = {
 
 
 def main():
+    # Windows/non-UTF-8 locales default stdout to the code page (cp1252), which
+    # crashes on the '->' / em-dash characters the engine prints. Force UTF-8.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--scope", required=True, help="engagement/scope JSON (name, in_scope, out_of_scope, seeds)")
     ap.add_argument("--base", default="~/.bughunter-engagements")
@@ -439,8 +478,12 @@ def main():
                     help="OPT-IN: skip provably-wasteful agent calls (known-confirmed / dead-class) "
                          "using the autopilot ledger. Default OFF = full coverage.")
     a = ap.parse_args()
-    if a.phases:
+    if a.phases is not None:
         phases = [p.strip() for p in a.phases.split(",") if p.strip()]
+        unknown = sorted(set(phases) - set(ALL_PHASES))
+        if unknown or not phases:
+            reason = f"unknown phase(s): {', '.join(unknown)}" if unknown else "no phases supplied"
+            ap.error(f"--phases: {reason}; choose from {', '.join(ALL_PHASES)}")
     elif a.hunt:
         phases = ALL_PHASES                       # full: map then auto-test
     else:

@@ -14,19 +14,22 @@ import time
 
 ENGINE = os.path.dirname(os.path.abspath(__file__))
 MCP_CONFIG = os.path.join(ENGINE, "burp-mcp.json")
-ALLOWED_TOOLS = " ".join([
+BURP_TOOLS = [
     "mcp__burp__send_http1_request", "mcp__burp__send_http2_request",
     "mcp__burp__get_collaborator_interactions", "mcp__burp__generate_collaborator_payload",
-    "Bash(curl:*)", "Bash(python3:*)", "Bash(jq:*)", "Bash(openssl:*)", "Bash(base64:*)",
-])
+]
+SHELL_TOOLS = ["Bash(curl:*)", "Bash(python3:*)", "Bash(jq:*)", "Bash(openssl:*)", "Bash(base64:*)"]
 
 
 def run_agent(task, skills_on=False, model="claude-sonnet-4-6", max_turns=40, timeout=600):
     # skills OFF by default: the eval showed they add ~0 capability but cost ~12-15k tokens/agent.
+    has_burp = os.path.exists(MCP_CONFIG)
+    config = MCP_CONFIG if has_burp else '{"mcpServers":{}}'
+    allowed_tools = SHELL_TOOLS + (BURP_TOOLS if has_burp else [])
     cmd = ["claude", "-p", task,
-           "--mcp-config", MCP_CONFIG, "--strict-mcp-config",
+           "--mcp-config", config, "--strict-mcp-config",
            "--permission-mode", "bypassPermissions",
-           "--allowedTools", ALLOWED_TOOLS,
+           "--allowedTools", " ".join(allowed_tools),
            "--max-turns", str(max_turns), "--model", model,
            "--output-format", "json"]
     if not skills_on:
@@ -46,8 +49,13 @@ def run_agent(task, skills_on=False, model="claude-sonnet-4-6", max_turns=40, ti
         # usage-limit / API errors come back as a short result with no real work
         if "usage limit" in res.lower() or "session limit" in res.lower():
             return {"result": res, "error": "rate-limited", "duration_s": round(time.time() - t0, 1)}
+        error = None
+        if d.get("is_error"):
+            error = d.get("subtype") or "agent-error"
+        elif p.returncode:
+            error = f"exit:{p.returncode}"
         return {"result": res, "cost_usd": d.get("total_cost_usd"),
-                "num_turns": d.get("num_turns"), "error": None,
+                "num_turns": d.get("num_turns"), "error": error,
                 "duration_s": round(time.time() - t0, 1)}
     except Exception as e:
         return {"result": p.stdout[:300], "error": f"parse:{e}", "duration_s": round(time.time() - t0, 1)}
@@ -57,13 +65,14 @@ def extract_json(text):
     """Pull the last valid JSON array/object out of an agent reply."""
     if not text:
         return None
-    blocks = re.findall(r"```json\s*(.*?)```", text, re.S)
-    blocks += re.findall(r"```\s*(\[.*?\]|\{.*?\})\s*```", text, re.S)
-    for b in reversed(blocks):
+    blocks = re.findall(r"```(?:json\s*|\s*)(.*?)```", text, re.S)
+    for block in reversed(blocks):
         try:
-            return json.loads(b.strip())
-        except Exception:
-            pass
+            value = json.loads(block.strip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, (dict, list)):
+            return value
     for b in reversed(re.findall(r"(\[.*\]|\{.*\})", text, re.S)):
         try:
             return json.loads(b)

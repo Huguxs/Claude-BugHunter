@@ -16,11 +16,13 @@
 #   --antigravity  force-copy skills → ~/.gemini/config/skills/ (Google AntiGravity)
 #   --all          DETECT installed harnesses and install to each: Claude always, ~/.agents
 #                  if Codex is present, ~/.hermes if Hermes is present, ~/.gemini/config/skills
-#                  if Google AntiGravity is present. With --burp-mcp it
-#                  wires Burp only into the detected harnesses. (--agents/--hermes/--antigravity still
-#                  force a path regardless of detection.)
+#                  if Google AntiGravity is present. With --burp-mcp / --hackerone-mcp
+#                  it wires those servers only into the detected harnesses. (--agents/--hermes/--antigravity
+#                  still force a path regardless of detection.)
 #   --burp-mcp  wire your existing Burp MCP server into the selected harnesses'
 #               configs (opt-in; backs up each config first; uses python3)
+#   --hackerone-mcp  wire the in-repo HackerOne MCP (mcp/hackerone/server.py) into
+#               the selected harnesses (opt-in; carries HACKERONE_API_* env if set)
 #   --normalize-frontmatter
 #               strip non-standard keys (sources/report_count) from the NON-Claude
 #               copies — only needed if a harness rejects unknown frontmatter keys
@@ -43,7 +45,7 @@ set -e
 # CRLF compound statement before any guard could run) — normalize it once with
 #   git add --renormalize . && git checkout .   (or re-clone).
 REPO_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
-BACKUP_DEST="$HOME/.claude/install-backups/$(date +%Y%m%d-%H%M%S)"
+BACKUP_DEST=""
 
 # Footprint tracking: each bundle records what it placed in ~/.claude here, so
 # uninstall removes only its own files and KEEPS skills a sibling bundle (e.g.
@@ -51,10 +53,11 @@ BACKUP_DEST="$HOME/.claude/install-backups/$(date +%Y%m%d-%H%M%S)"
 BUNDLE_NAME="claude-bughunter"
 MANIFEST_DIR="$HOME/.claude/.skill-manifests"
 MANIFEST="$MANIFEST_DIR/$BUNDLE_NAME.txt"
+HARNESS_MANIFEST_DIR="$MANIFEST_DIR/$BUNDLE_NAME-harnesses"
 
 usage() { sed -n '2,/^# ===/p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; }
 
-DO_AGENTS=0; DO_HERMES=0; DO_ANTIGRAVITY=0; DO_MCP=0; NORMALIZE=0; DETECT=0; DO_UNINSTALL=0; NO_SHELL=0
+DO_AGENTS=0; DO_HERMES=0; DO_ANTIGRAVITY=0; DO_MCP=0; DO_H1_MCP=0; NORMALIZE=0; DETECT=0; DO_UNINSTALL=0; NO_SHELL=0
 HAS_CLAUDE=0; HAS_OPENCODE=0; HAS_CODEX=0; HAS_HERMES=0; HAS_ANTIGRAVITY=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -63,6 +66,7 @@ while [ $# -gt 0 ]; do
     --antigravity) DO_ANTIGRAVITY=1 ;;
     --all)    DETECT=1 ;;
     --burp-mcp) DO_MCP=1 ;;
+    --hackerone-mcp) DO_H1_MCP=1 ;;
     --normalize-frontmatter) NORMALIZE=1 ;;
     --no-shell) NO_SHELL=1 ;;
     --uninstall) DO_UNINSTALL=1 ;;
@@ -80,7 +84,7 @@ uninstall_bundle() {
     return 0
   fi
   echo "Uninstalling $BUNDLE_NAME using $MANIFEST"
-  local rel target other owned removed=0 kept=0
+  local rel target other owned removed=0 kept=0 label
   while IFS= read -r rel; do
     [ -z "$rel" ] && continue
     target="$HOME/.claude/$rel"
@@ -94,19 +98,26 @@ uninstall_bundle() {
       kept=$((kept + 1))                 # another bundle still owns it — keep
     else
       rm -rf "$target"
-      if [ -e "$HOME/.agents/$rel" ]; then rm -rf "$HOME/.agents/$rel"; fi
-      if [ -e "$HOME/.hermes/$rel" ]; then rm -rf "$HOME/.hermes/$rel"; fi
-      if [ -e "$HOME/.gemini/config/$rel" ]; then rm -rf "$HOME/.gemini/config/$rel"; fi
+      if [[ "$rel" == skills/* ]]; then
+        if [ -f "$HARNESS_MANIFEST_DIR/agents" ]; then rm -rf "$HOME/.agents/$rel"; fi
+        if [ -f "$HARNESS_MANIFEST_DIR/hermes" ]; then rm -rf "$HOME/.hermes/$rel"; fi
+        if [ -f "$HARNESS_MANIFEST_DIR/antigravity" ]; then rm -rf "$HOME/.gemini/config/$rel"; fi
+      fi
       removed=$((removed + 1))
     fi
   done < "$MANIFEST"
+  for label in agents hermes antigravity; do rm -f "$HARNESS_MANIFEST_DIR/$label"; done
   rm -f "$MANIFEST"
   echo "  ✓ removed $removed item(s); kept $kept still owned by another bundle"
-  # The hunt.sh rc source line is ours alone — strip it from shell rc files.
-  for rc in "$HOME/.zshrc" "$HOME/.bashrc" "${ZDOTDIR:-}/.zshrc"; do
+  # Remove the installer stanza from user shell files, preserving references
+  # such as a comment or command that prints the source path.
+  local source_re='^source ~/\.claude/scripts/hunt\.sh$'
+  local comment_re='^# Bug-bounty engagement scaffolding (bug-bounty-claude-skills)$'
+  local rc
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc" "${ZDOTDIR:-$HOME}/.zshrc"; do
     [ -f "$rc" ] || continue
-    if grep -q "claude/scripts/hunt.sh" "$rc" 2>/dev/null; then
-      sed -i.bak '/claude\/scripts\/hunt.sh/d; /Bug-bounty engagement scaffolding/d' "$rc"
+    if grep -q "$source_re" "$rc" 2>/dev/null; then
+      sed -i.bak -e "\|$source_re|d" -e "\|$comment_re|d" "$rc"
       echo "  ✓ removed hunt.sh source line from $rc (backup: $rc.bak)"
     fi
   done
@@ -145,6 +156,16 @@ fi
 
 SKILL_COUNT="$(find "$REPO_DIR/skills" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
 
+# Allocate a unique directory only when there is something to back up.
+prepare_backup_dir() {
+  if [ -z "$BACKUP_DEST" ]; then
+    local backup_root="$HOME/.claude/install-backups"
+    mkdir -p "$backup_root"
+    BACKUP_DEST="$(mktemp -d "$backup_root/$(date +%Y%m%d-%H%M%S)-XXXXXX")"
+  fi
+  mkdir -p "$BACKUP_DEST/$1"
+}
+
 # Copy every skill folder into <dest>, backing up any existing same-name dir
 # OUTSIDE the loading path. $2 is a label used for the backup subfolder + logging.
 install_skills() {
@@ -159,7 +180,7 @@ install_skills() {
       if diff -rq --exclude=__pycache__ "$skill_dir" "$dest/$name" >/dev/null 2>&1; then
         continue
       fi
-      mkdir -p "$BACKUP_DEST/$label"
+      prepare_backup_dir "$label"
       mv "$dest/$name" "$BACKUP_DEST/$label/$name"
     fi
     cp -r "$skill_dir" "$dest/$name"
@@ -184,7 +205,7 @@ if [ -d "$REPO_DIR/commands" ]; then
     cmd_name="$(basename "$cmd_file")"
     if [ -f "$COMMANDS_DEST/$cmd_name" ] && [ ! -L "$COMMANDS_DEST/$cmd_name" ]; then
       if cmp -s "$cmd_file" "$COMMANDS_DEST/$cmd_name"; then continue; fi
-      mkdir -p "$BACKUP_DEST/commands"
+      prepare_backup_dir commands
       mv "$COMMANDS_DEST/$cmd_name" "$BACKUP_DEST/commands/$cmd_name"
     fi
     cp "$cmd_file" "$COMMANDS_DEST/$cmd_name"
@@ -243,26 +264,41 @@ echo "    Uninstall later with:  bash scripts/install.sh --uninstall"
 echo ""
 
 # === Extra harness targets (skills only) ===
+record_harness() {
+  mkdir -p "$HARNESS_MANIFEST_DIR"
+  touch "$HARNESS_MANIFEST_DIR/$1"
+}
+
 if [ "$DO_AGENTS" = "1" ]; then
   install_skills "$HOME/.agents/skills" "agents"
+  record_harness agents
   # Codex (which reads ~/.agents/skills) HARD-rejects descriptions > 1024 chars.
   # Auto-truncate over-length descriptions in THIS copy only — ~/.claude and
   # ~/.hermes keep full descriptions. Optional --normalize-frontmatter also strips
   # non-standard keys (sources/report_count). Python3 only; skipped if absent.
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$HOME/.agents/skills" "$NORMALIZE" <<'PY'
+    python3 - "$HOME/.agents/skills" "$NORMALIZE" "$REPO_DIR/skills" <<'PY'
 import os, re, sys
 root, strip_extra = sys.argv[1], sys.argv[2] == "1"
 LIMIT = 1024
-for name in sorted(os.listdir(root)):
+# Limit edits to copies from this bundle. The destination may contain
+# independently installed skills and symlinks.
+for name in sorted(os.listdir(sys.argv[3])):
+    if not os.path.isdir(os.path.join(sys.argv[3], name)):
+        continue
     p = os.path.join(root, name, "SKILL.md")
-    if not os.path.isfile(p):
+    if os.path.islink(os.path.dirname(p)) or os.path.islink(p) or not os.path.isfile(p):
         continue
     lines = open(p, encoding="utf-8").read().split("\n")
+    if not lines or lines[0] != '---':
+        continue
+    try:
+        end = lines.index('---', 1)
+    except ValueError:
+        continue
     out, changed = [], False
     for i, line in enumerate(lines):
-        # frontmatter sits at the very top; only touch the first ~12 lines
-        m = re.match(r'^description:\s*(.*)$', line) if i < 12 else None
+        m = re.match(r'^description:\s*(.*)$', line) if 0 < i < end else None
         if m:
             val = m.group(1)
             quoted = len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'"
@@ -272,7 +308,7 @@ for name in sorted(os.listdir(root)):
                 line = 'description: "' + cut + '…"'
                 changed = True
                 print(f"    ✂ truncated {name} description {len(inner)}→{len(cut)+1} (Codex 1024 limit)")
-        if strip_extra and i < 12 and re.match(r'^(sources|report_count):\s', line):
+        if strip_extra and 0 < i < end and re.match(r'^(sources|report_count):\s', line):
             changed = True
             continue
         out.append(line)
@@ -281,14 +317,20 @@ for name in sorted(os.listdir(root)):
 PY
   fi
 fi
-if [ "$DO_HERMES" = "1" ]; then install_skills "$HOME/.hermes/skills" "hermes"; fi
-if [ "$DO_ANTIGRAVITY" = "1" ]; then install_skills "$HOME/.gemini/config/skills" "antigravity"; fi
+if [ "$DO_HERMES" = "1" ]; then
+  install_skills "$HOME/.hermes/skills" "hermes"
+  record_harness hermes
+fi
+if [ "$DO_ANTIGRAVITY" = "1" ]; then
+  install_skills "$HOME/.gemini/config/skills" "antigravity"
+  record_harness antigravity
+fi
 
-# === Opt-in: wire the existing Burp MCP into the selected harnesses ===
-if [ "$DO_MCP" = "1" ]; then
+# === Opt-in: wire the Burp and/or HackerOne MCP into the selected harnesses ===
+if [ "$DO_MCP" = "1" ] || [ "$DO_H1_MCP" = "1" ]; then
   MCP_TARGETS=""
   if [ "$DETECT" = "1" ]; then
-    # detection mode: wire Burp only into the harnesses actually present
+    # detection mode: wire only into the harnesses actually present
     if [ "$HAS_OPENCODE"    = "1" ]; then MCP_TARGETS="$MCP_TARGETS --opencode"; fi
     if [ "$HAS_CODEX"       = "1" ]; then MCP_TARGETS="$MCP_TARGETS --codex"; fi
     if [ "$HAS_HERMES"      = "1" ]; then MCP_TARGETS="$MCP_TARGETS --hermes"; fi
@@ -299,14 +341,18 @@ if [ "$DO_MCP" = "1" ]; then
     if [ "$DO_HERMES"      = "1" ]; then MCP_TARGETS="$MCP_TARGETS --hermes"; fi
     if [ "$DO_ANTIGRAVITY" = "1" ]; then MCP_TARGETS="$MCP_TARGETS --antigravity"; fi
   fi
+  # which servers to wire (both can be on at once)
+  MCP_SERVERS=""
+  if [ "$DO_MCP"    = "1" ]; then MCP_SERVERS="$MCP_SERVERS --burp"; fi
+  if [ "$DO_H1_MCP" = "1" ]; then MCP_SERVERS="$MCP_SERVERS --hackerone"; fi
   if [ -z "$MCP_TARGETS" ]; then
-    echo "  ⚠ --burp-mcp found no non-Claude harness (none detected, no --agents/--hermes/--antigravity). Skipping."
+    echo "  ⚠ MCP wiring found no non-Claude harness (none detected, no --agents/--hermes/--antigravity). Skipping."
   elif command -v python3 >/dev/null 2>&1; then
     # shellcheck disable=SC2086
-    python3 "$REPO_DIR/scripts/setup_harness_mcp.py" $MCP_TARGETS || \
-      echo "  ⚠ Burp MCP wiring reported an issue — see scripts/setup_harness_mcp.py output."
+    python3 "$REPO_DIR/scripts/setup_harness_mcp.py" $MCP_SERVERS $MCP_TARGETS || \
+      echo "  ⚠ MCP wiring reported an issue — see scripts/setup_harness_mcp.py output."
   else
-    echo "  ⚠ python3 not found — skipping --burp-mcp. See docs/multi-harness.md for manual snippets."
+    echo "  ⚠ python3 not found — skipping MCP wiring. See docs/multi-harness.md for manual snippets."
   fi
   echo ""
 fi

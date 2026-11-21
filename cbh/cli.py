@@ -35,6 +35,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -94,7 +95,7 @@ def section(title: str):
 
 
 def has_cmd(name: str) -> bool:
-    return subprocess.call(["which", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+    return shutil.which(name) is not None
 
 
 def run_cmd(cmd: list[str], timeout: int = 30) -> tuple[int, str, str]:
@@ -105,6 +106,14 @@ def run_cmd(cmd: list[str], timeout: int = 30) -> tuple[int, str, str]:
         return 124, "", "timeout"
     except FileNotFoundError:
         return 127, "", "not found"
+
+
+class _ObserveRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not getattr(req, "cbh_follow_redirects", True):
+            # Active probe evidence belongs to the requested host.
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 _HTTP_OPENER: urllib.request.OpenerDirector | None = None
@@ -145,7 +154,7 @@ def configure_http_proxy(proxy_url: str | None = None, insecure: bool = False) -
 
     proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
     https_handler = urllib.request.HTTPSHandler(context=ctx)
-    _HTTP_OPENER = urllib.request.build_opener(proxy_handler, https_handler)
+    _HTTP_OPENER = urllib.request.build_opener(proxy_handler, https_handler, _ObserveRedirect())
     return True, f"via proxy {proxy_url} ({'TLS verify OFF' if insecure else 'TLS verify on'})"
 
 
@@ -161,23 +170,28 @@ def detect_burp() -> str | None:
     return None
 
 
-def http_get(url: str, timeout: int = 5, headers: dict | None = None) -> tuple[int, dict, str]:
+def http_get(url: str, timeout: int = 5, headers: dict | None = None,
+             *, follow_redirects: bool = True) -> tuple[int, dict, str]:
     """Stdlib HTTP GET returning (status_code, headers_dict, body_str). Routes
     through the configured proxy (e.g. Burp) if `configure_http_proxy()` was
-    called. Returns (0, {}, error_msg) on failure."""
+    called. Set follow_redirects=False to observe the first response.
+    Returns (0, {}, error_msg) on failure."""
     req = urllib.request.Request(url, headers=headers or {})
-    opener = _HTTP_OPENER if _HTTP_OPENER is not None else urllib.request
+    req.cbh_follow_redirects = follow_redirects
+    if _HTTP_OPENER is not None:
+        open_request = _HTTP_OPENER.open
+    elif follow_redirects:
+        open_request = urllib.request.urlopen
+    else:
+        open_request = urllib.request.build_opener(_ObserveRedirect()).open
     try:
-        if _HTTP_OPENER is not None:
-            with _HTTP_OPENER.open(req, timeout=timeout) as r:
-                body = r.read().decode("utf-8", errors="replace")
-                return r.status, dict(r.headers), body
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with open_request(req, timeout=timeout) as r:
             body = r.read().decode("utf-8", errors="replace")
             return r.status, dict(r.headers), body
     except urllib.error.HTTPError as e:
         try:
-            body = e.read().decode("utf-8", errors="replace")
+            with e:
+                body = e.read().decode("utf-8", errors="replace")
         except Exception:
             body = ""
         return e.code, dict(e.headers or {}), body
@@ -201,17 +215,26 @@ def recon_subdomains_via_crtsh(target: str) -> set[str]:
         return set()
     try:
         rows = json.loads(body)
-    except Exception:
-        print("[warning] crt.sh returned unparseable JSON — subdomain results may be INCOMPLETE.",
+    except json.JSONDecodeError:
+        rows = None
+    if not isinstance(rows, list):
+        print("[warning] crt.sh returned an unexpected response — subdomain results may be INCOMPLETE.",
               file=sys.stderr, flush=True)
         return set()
     subs = set()
-    for r in rows:
-        nv = (r.get("name_value") or "").lower()
-        for line in nv.split("\n"):
-            line = line.strip()
-            if line and "*" not in line:
-                subs.add(line)
+    malformed = False
+    for row in rows:
+        names = row.get("name_value") if isinstance(row, dict) else None
+        if not isinstance(names, str):
+            malformed = True
+            continue
+        for name in names.lower().splitlines():
+            name = name.strip()
+            if name and "*" not in name:
+                subs.add(name)
+    if malformed:
+        print("[warning] crt.sh returned malformed entries — subdomain results may be INCOMPLETE.",
+              file=sys.stderr, flush=True)
     return subs
 
 
@@ -237,9 +260,10 @@ def recon_http_probe(host: str) -> dict | None:
     a record with code/server/title or None if unreachable."""
     for scheme in ("https", "http"):
         url = f"{scheme}://{host}/"
-        code, headers, body = http_get(url, timeout=4)
+        code, headers, body = http_get(url, timeout=4, follow_redirects=False)
         if code == 0:
             continue
+        headers = {key.lower(): value for key, value in headers.items()}
         title = ""
         m = re.search(r"<title[^>]*>([^<]*)</title>", body[:8192], re.I)
         if m:
@@ -247,10 +271,10 @@ def recon_http_probe(host: str) -> dict | None:
         return {
             "url": url,
             "code": code,
-            "server": headers.get("Server", ""),
+            "server": headers.get("server", ""),
             "title": title,
-            "powered_by": headers.get("X-Powered-By", ""),
-            "drupal_cache": headers.get("X-Drupal-Cache", ""),
+            "powered_by": headers.get("x-powered-by", ""),
+            "drupal_cache": headers.get("x-drupal-cache", ""),
         }
     return None
 
@@ -270,8 +294,23 @@ def configure_proxy_from_args(args: argparse.Namespace) -> None:
         say(color(f"  Tip: requests will appear in Burp Proxy → HTTP history.", "dim"))
 
 
+def _recon_hostname(value: str) -> str | None:
+    try:
+        hostname = value.encode("idna").decode("ascii").lower().removesuffix(".")
+    except UnicodeError:
+        return None
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    if len(hostname) > 253 or not re.fullmatch(rf"{label}(?:\.{label})*", hostname):
+        return None
+    return hostname
+
+
 def cmd_recon(args: argparse.Namespace) -> int:
-    target = args.target
+    target = _recon_hostname(args.target)
+    if target is None:
+        print("[error] recon target must be a hostname without a scheme, port, or path",
+              file=sys.stderr)
+        return 1
     # Clone mode writes under the repo; installed mode writes under the CWD
     # (never into site-packages). Override with --out.
     recon_root = Path(args.out).resolve() if getattr(args, "out", None) \
@@ -301,10 +340,13 @@ def cmd_recon(args: argparse.Namespace) -> int:
         say(f"  subfinder: {len(sf)} candidates (new: {len(subs) - before})")
     else:
         say(f"  subfinder: {color('not installed', 'dim')}")
-    if not subs:
-        subs.add(target)
+    # A certificate can include SANs from unrelated domains. Treat both
+    # passive sources as untrusted before resolving or probing candidates.
+    candidates = {_recon_hostname(candidate) for candidate in subs}
+    subs = {host for host in candidates
+            if host is not None and (host == target or host.endswith("." + target))}
     subs.add(target)
-    (out_dir / "subdomains.txt").write_text("\n".join(sorted(subs)) + "\n")
+    (out_dir / "subdomains.txt").write_text("\n".join(sorted(subs)) + "\n", encoding="utf-8")
     say(f"  Total unique: {color(str(len(subs)), 'bold')}")
 
     # Step 2 — DNS resolution
@@ -316,7 +358,8 @@ def cmd_recon(args: argparse.Namespace) -> int:
         if ips:
             resolved[s] = ips
     (out_dir / "resolved.txt").write_text(
-        "\n".join(f"{h}|{','.join(ips)}" for h, ips in sorted(resolved.items())) + "\n"
+        "\n".join(f"{h}|{','.join(ips)}" for h, ips in sorted(resolved.items())) + "\n",
+        encoding="utf-8",
     )
     say(f"  Resolved: {color(str(len(resolved)), 'bold')} / {len(subs)}")
 
@@ -333,7 +376,7 @@ def cmd_recon(args: argparse.Namespace) -> int:
             if rec:
                 rec["host"] = host
                 live.append(rec)
-    (out_dir / "live-hosts.json").write_text(json.dumps(live, indent=2))
+    (out_dir / "live-hosts.json").write_text(json.dumps(live, indent=2), encoding="utf-8")
     say(f"  HTTP-live: {color(str(len(live)), 'bold')} / {len(resolved)}")
 
     # Step 4 — summary report
@@ -346,7 +389,7 @@ def cmd_recon(args: argparse.Namespace) -> int:
     # recon→hunt handoff contract — see docs/recon-manifest.md
     manifest = build_manifest(target, subs, resolved, live)
     manifest_path = out_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     say(f"  {manifest_path}  {color('(recon→hunt manifest)', 'dim')}")
 
     section("SUMMARY")
@@ -388,7 +431,7 @@ def write_recon_summary(target: str, subs: set[str], resolved: dict, live: list,
         "- For `mta-sts.*` / `*.github.io` hosts, fingerprint against `hunt-subdomain` takeover table.",
         "",
     ]
-    out.write_text("\n".join(lines))
+    out.write_text("\n".join(lines), encoding="utf-8")
 
 
 # ============================================================
@@ -628,7 +671,7 @@ def cmd_triage(args: argparse.Namespace) -> int:
     answers = []
     for qid, question, signals in TRIAGE_QUESTIONS:
         # Q7 is INVERTED: presence of a "never-submit" signal = answer is "NO" (kill)
-        hit = any(s in text for s in signals)
+        hit = any(s.lower() in text for s in signals)
         if qid == "Q7":
             answer = "NO — finding matches never-submit category" if hit else "YES"
             ok = not hit
@@ -660,6 +703,29 @@ def cmd_triage(args: argparse.Namespace) -> int:
 # ============================================================
 # report — emit a report draft based on finding metadata
 # ============================================================
+def _mask_report_fences(body: str) -> str:
+    """Hide fenced code from heading matching while retaining source offsets."""
+    masked = []
+    opener = None
+    for line in body.splitlines(keepends=True):
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})([^\n]*)", line)
+        if opener is not None:
+            masked.append(re.sub(r"[^\n]", " ", line))
+            if fence:
+                marker, rest = fence.groups()
+                if marker.startswith(opener) and not rest.strip():
+                    opener = None
+            continue
+        if fence:
+            marker, rest = fence.groups()
+            if marker.startswith("~") or "`" not in rest:
+                opener = marker
+                masked.append(re.sub(r"[^\n]", " ", line))
+                continue
+        masked.append(line)
+    return "".join(masked)
+
+
 def parse_finding_metadata(text: str) -> dict:
     """Best-effort parse of YAML-ish frontmatter + section content."""
     md = {"title": "", "severity": "Medium", "asset": "", "endpoint": "",
@@ -673,19 +739,27 @@ def parse_finding_metadata(text: str) -> dict:
                 k, _, v = line.partition(":")
                 md[k.strip().lower()] = v.strip().strip('"').strip("'")
         body = m.group(2)
-    # Section grabbers
-    for key, pat in [
-        ("summary", r"##\s*(?:summary|description)\s*\n(.+?)(?=\n##|\Z)"),
-        ("steps", r"##\s*(?:steps|reproduction|reproduce|poc)\s*\n(.+?)(?=\n##|\Z)"),
-        ("impact", r"##\s*impact\s*\n(.+?)(?=\n##|\Z)"),
-        ("remediation", r"##\s*(?:remediation|fix|mitigation)\s*\n(.+?)(?=\n##|\Z)"),
-    ]:
-        m = re.search(pat, body, re.I | re.S)
-        if m and not md.get(key):
-            md[key] = m.group(1).strip()
+    # Match headings outside fenced code, then copy the original section text.
+    headings_only = _mask_report_fences(body)
+    sections = {
+        "summary": ("summary", "description"),
+        "steps": ("steps", "reproduction", "reproduce", "proof of concept", "proof", "poc"),
+        "impact": ("impact",),
+        "remediation": ("remediation", "fix", "mitigation"),
+    }
+    for key, headings in sections.items():
+        # keyword may be followed by more words on the heading line (e.g.
+        # "## Steps to reproduce"); require a space before them so it does not
+        # match mid-word ("## Stepsister").
+        pattern = (r"^##[ \t]*(?:" + "|".join(headings)
+                   + r")(?:[ \t][^\n]*)?[ \t]*\n(.*?)(?=^#{1,2}(?!#)|\Z)")
+        match = re.search(pattern, headings_only, re.I | re.M | re.S)
+        if match and not md.get(key):
+            start, end = match.span(1)
+            md[key] = body[start:end].strip()
     # First line as title if missing
     if not md["title"]:
-        for line in body.splitlines():
+        for line in headings_only.splitlines():
             line = line.strip()
             if line.startswith("# "):
                 md["title"] = line[2:].strip()
@@ -693,7 +767,7 @@ def parse_finding_metadata(text: str) -> dict:
     return md
 
 
-def render_report(md: dict, platform: str) -> str:
+def render_report(md: dict, platform: str, reporter: str = None) -> str:
     """Render a report draft using the report-writing + bugcrowd-reporting style.
     Built with plain string concatenation to avoid textwrap.dedent issues with
     multi-line interpolated content."""
@@ -704,7 +778,9 @@ def render_report(md: dict, platform: str) -> str:
     impact = md.get("impact") or "(fill in — concrete dollar / PII / state impact)"
     remediation = md.get("remediation") or "(fill in)"
     asset = md.get("asset") or md.get("endpoint") or "(fill in)"
-    user = os.environ.get('USER', 'researcher')
+    # Never leak the OS login name into a public draft (#190): take the handle
+    # from --reporter / CBH_REPORTER, else a placeholder the operator fills in.
+    user = reporter or os.environ.get("CBH_REPORTER") or "(your handle)"
     today = datetime.date.today().isoformat()
 
     if platform == "bugcrowd":
@@ -800,14 +876,16 @@ def cmd_report(args: argparse.Namespace) -> int:
         say(color(f"  finding not found: {finding_path}", "red"))
         return 2
     md = parse_finding_metadata(finding_path.read_text(encoding="utf-8"))
-    draft = render_report(md, args.platform)
+    platform = "h1" if args.platform == "hackerone" else args.platform
+    draft = render_report(md, platform, reporter=getattr(args, "reporter", None))
     if args.out:
         out_path = Path(args.out).resolve()
         cwd = Path.cwd().resolve()
         # Ancestry check, not str.startswith (which a `<cwd>-evil` sibling bypasses).
         if cwd not in out_path.parents:
             print("[error] --out path must be within cwd", file=sys.stderr); return 1
-        out_path.write_text(draft)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(draft, encoding="utf-8")
         section(f"report — {args.platform}")
         say(f"  Draft written: {color(str(out_path), 'bold')}")
         say()
@@ -839,6 +917,16 @@ def cmd_surface(args: argparse.Namespace) -> int:
         m = json.loads(mpath.read_text(encoding="utf-8"))
     except Exception as e:
         print(f"[error] could not parse {mpath}: {e}", file=sys.stderr)
+        return 1
+
+    if not isinstance(m, dict):
+        print(f"[error] invalid recon manifest at {mpath}: expected a JSON object", file=sys.stderr)
+        return 1
+    if not isinstance(m.get("counts", {}), dict) or not isinstance(m.get("ranked_surface", []), list):
+        print(f"[error] invalid recon manifest at {mpath}: invalid counts or ranked_surface", file=sys.stderr)
+        return 1
+    if any(not isinstance(row, dict) for row in m.get("ranked_surface", [])):
+        print(f"[error] invalid recon manifest at {mpath}: ranked_surface entries must be objects", file=sys.stderr)
         return 1
 
     section(f"surface — {m.get('target', target)}")
@@ -927,7 +1015,11 @@ def main() -> int:
     p_report = sub.add_parser("report", help="emit a report draft")
     p_report.add_argument("finding", help="path to finding markdown file")
     p_report.add_argument("--platform", default="h1",
-                          choices=["h1", "bugcrowd", "intigriti", "immunefi"])
+                          choices=["h1", "hackerone", "bugcrowd", "intigriti", "immunefi"],
+                          help="target platform ('hackerone' is an alias of 'h1')")
+    p_report.add_argument("--reporter", default=None,
+                          help="your platform handle for the Reporter line "
+                               "(or set CBH_REPORTER); omitted -> placeholder")
     p_report.add_argument("--out", help="write draft to this path (else print to stdout)")
     p_report.set_defaults(func=cmd_report)
 

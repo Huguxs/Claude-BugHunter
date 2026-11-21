@@ -1,6 +1,6 @@
 ---
 name: hunt
-description: Active vulnerability hunting. Two-track dispatcher — asks Red Team vs WAPT, hands off to hunt-dispatch skill and sibling commands. Usage: /hunt target.com | /hunt *.target.com | /hunt targets.txt [--vuln-class X] [--source-code P] [--chrome]
+description: "Active vulnerability hunting. Two-track dispatcher — asks Red Team vs WAPT, hands off to hunt-dispatch skill and sibling commands. Usage: /hunt target.com | /hunt *.target.com | /hunt targets.txt [--vuln-class X] [--source-code P] [--chrome]"
 ---
 
 # /hunt
@@ -95,6 +95,8 @@ session end              →  /remember  (silent)
 ## step 4 — active testing
 
 hand off to the loaded `hunt-*` skills. each skill has its own probes, payloads, validation. do not duplicate that logic here. on every confirmed finding, invoke `/chain` to check the A→B signal table.
+
+when testing a vuln-class on a program, read the real precedent first: call `search_disclosed_reports(query=<vuln-class>, program=<handle>)`, then `get_report(url=<top result's url>)` (both are HackerOne MCP tools, keyless), read the disclosed write-up, and mirror its exact technique and bypass on the live target. if `get_report` returns a `note` (thin or empty public body), fall back to the distilled pattern in `docs/disclosed-reports/`.
 
 ## modes
 

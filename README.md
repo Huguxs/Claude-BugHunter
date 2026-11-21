@@ -9,10 +9,10 @@ Built by **[Sachin Sharma](https://www.linkedin.com/in/sachinsharma8080/)** — 
 <p align="center">
   <sub>SPONSORED BY</sub>
   <br/>
-  <a href="https://www.atlascloud.ai/console/coding-plan">
+  <a href="https://www.apismart.ai/">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/sponsors/atlas-cloud-dark.svg">
-      <img alt="Atlas Cloud" src="assets/sponsors/atlas-cloud-light.svg" height="36">
+      <source media="(prefers-color-scheme: dark)" srcset="assets/sponsors/apismart-dark.png">
+      <img alt="ApiSmart" src="assets/sponsors/apismart-light.png" height="30">
     </picture>
   </a>
   &nbsp;&nbsp;&nbsp;&nbsp;
@@ -51,6 +51,8 @@ All triggered automatically by topic — describe what you're testing in plain E
 ```
 
 All 83 skills + 15 commands load namespaced under `claude-bughunter:` and update when you bump the plugin version — no files copied into `~/.claude/`.
+
+**A HackerOne account is optional.** The install asks for a HackerOne API username and token. They only let the HackerOne MCP read your private programs and your own reports; leave both blank if you don't need that. Every skill, command and the MCP's public tools (duplicate search, program scope) work without them.
 
 **Option B — copy install (no plugin system / pin to a clone):**
 
@@ -274,7 +276,7 @@ The per-class `hunt-*` skills address gap-zero (*"what should I look for in weba
 
 ## Roadmap
 
-- [ ] HackerOne MCP integration (currently only Burp MCP wired in)
+- [x] HackerOne MCP integration — [`mcp/hackerone/`](mcp/hackerone/README.md): disclosed-report duplicate search, program stats and scope; optional logged-in mode for private programs and your own reports
 - [ ] Per-engagement memory layer — pattern recall across targets
 - [x] Industry-specific hunt skills — `hunt-fintech-graphql` shipped; `hunt-healthcare-fhir`, `hunt-gov-compliance` still open
 - [ ] Program-rules-parser skill — auto-generate structured `scope.md` from program text
@@ -288,17 +290,13 @@ The per-class `hunt-*` skills address gap-zero (*"what should I look for in weba
 ## Sponsors
 
 <p align="center">
-  <a href="https://www.atlascloud.ai/console/coding-plan"><picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/sponsors/atlas-cloud-dark.svg">
-    <img alt="Atlas Cloud" src="assets/sponsors/atlas-cloud-light.svg" width="340">
+  <a href="https://www.apismart.ai/"><picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/sponsors/apismart-dark.png">
+    <img alt="ApiSmart" src="assets/sponsors/apismart-light.png" width="210">
   </picture></a>
 </p>
 
-**[Atlas Cloud](https://www.atlascloud.ai/console/coding-plan)** is a full-modal AI inference platform that gives developers a single AI API to access video generation, image generation, and LLM APIs. Instead of managing multiple vendor integrations, you connect once and get unified access to 300+ curated models across all modalities.
-
-Check out Atlas Cloud's new coding plan promotion for more budget-friendly API access: **<https://www.atlascloud.ai/console/coding-plan>**
-
-
+**[ApiSmart](https://www.apismart.ai/)** unifies leading LLM, image, and video models through one OpenAI-compatible API. Use one key to switch models, simplify billing, and improve reliability with automatic failover.
 
 <p align="center">
   <a href="https://threatwatch360.com"><picture>

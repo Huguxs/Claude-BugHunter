@@ -28,23 +28,38 @@ class Engagement:
         self.state_path = os.path.join(self.dir, "state.json")
         self.log_path = os.path.join(self.dir, "engine.log")
         self.state = self._load()
+        self.state.setdefault("rejected", [])
+
+    DEFAULTS = {"targets": [], "surface": [], "tested": [], "candidates": [], "confirmed": [],
+                "coverage": {}, "coverage_by_item": {}}
+
+    def _fresh_defaults(self):
+        # Fresh copies — never alias the mutable class-level DEFAULTS into instance state.
+        return {k: (dict(v) if isinstance(v, dict) else list(v)) for k, v in self.DEFAULTS.items()}
 
     def _load(self):
         if os.path.isfile(self.state_path):
-            return json.load(open(self.state_path))
-        return {"name": self.name, "created": _now(), "phase": "init",
-                "targets": [], "surface": [], "tested": [], "candidates": [], "confirmed": []}
+            s = json.load(open(self.state_path, encoding="utf-8"))
+            for k, v in self._fresh_defaults().items():   # forward-compat with pre-ledger engagements
+                s.setdefault(k, v)
+            return s
+        return {"name": self.name, "created": _now(), "phase": "init", **self._fresh_defaults()}
 
     def save(self):
         tmp = self.state_path + ".tmp"
-        json.dump(self.state, open(tmp, "w"), indent=2)
+        json.dump(self.state, open(tmp, "w", encoding="utf-8"), indent=2)
         os.replace(tmp, self.state_path)
 
     def log(self, msg):
         line = f"{_now()}  {msg}"
-        with open(self.log_path, "a") as f:
+        with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
-        print("  " + msg, flush=True)
+        try:
+            print("  " + msg, flush=True)
+        except UnicodeEncodeError:
+            # A non-UTF-8 console (Windows cp1252) must not crash the run; the
+            # full line is already in the UTF-8 log file.
+            print("  " + msg.encode("ascii", "replace").decode("ascii"), flush=True)
 
     # ---- phase ----
     def set_phase(self, phase):
@@ -74,10 +89,15 @@ class Engagement:
     def _key(s):
         return f"{s['url']}|{s.get('param','')}|{s.get('vuln_class','')}"
 
-    def mark_tested(self, item):
+    def mark_tested(self, item, candidate=None, coverage=None, note=""):
         k = self._key(item)
         if k not in self.state["tested"]:
+            if candidate is not None:
+                candidate["ts"] = _now()
+                self.state["candidates"].append(candidate)
             self.state["tested"].append(k)
+            if coverage is not None:
+                self._set_item_coverage(item, coverage, note)
             self.save()
 
     # ---- findings ----
@@ -89,6 +109,20 @@ class Engagement:
     def confirm(self, finding, verdict):
         finding = {**finding, "verdict": verdict, "confirmed_ts": _now()}
         self.state["confirmed"].append(finding)
+        self.save()
+
+    # ---- coverage ledger (writer: hunt) ----
+    # A count of tested items cannot answer "which classes were never tried on
+    # host X". This can, and the report renders its caveats from it.
+    def _set_item_coverage(self, item, verdict, note):
+        from closure import VERDICTS
+        if verdict not in VERDICTS:
+            raise ValueError(f"unknown coverage verdict {verdict!r}; expected one of {sorted(VERDICTS)}")
+        self.state["coverage_by_item"][self._key(item)] = {
+            "verdict": verdict, "note": note, "ts": _now()}
+
+    def record_coverage(self, item, verdict, note=""):
+        self._set_item_coverage(item, verdict, note)
         self.save()
 
     def evidence_path(self, fname):

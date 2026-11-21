@@ -46,9 +46,12 @@ def oracle(base, name):
             data = json.load(r)["data"]
     except Exception:
         return None, False
-    for c in data:
-        if c["name"] == name:
-            return bool(c["solved"]), True
+    if not isinstance(data, list):
+        return None, False
+    for challenge in data:
+        if isinstance(challenge, dict) and challenge.get("name") == name:
+            solved = challenge.get("solved")
+            return (solved, True) if isinstance(solved, bool) else (None, False)
     return None, False
 
 
@@ -64,8 +67,12 @@ def wait_ready(base, tries=40):
 
 def reset_target(container, base):
     """Restart Juice Shop → clean (all-unsolved) state, so each run is isolated."""
-    subprocess.run(["docker", "restart", container], capture_output=True)
-    return wait_ready(base)
+    try:
+        result = subprocess.run(["docker", "restart", container], capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and wait_ready(base)
+
 
 
 JUICE_DESC = ("this is a local OWASP Juice Shop instance, a deliberately vulnerable "
@@ -105,11 +112,15 @@ def run_agent(task, skills_on, model, max_turns, timeout):
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return {"agent_error": "timeout", "duration_s": round(time.time() - t0, 1)}
+    except OSError as e:
+        return {"agent_error": f"launch:{type(e).__name__}", "duration_s": round(time.time() - t0, 1)}
     dur = round(time.time() - t0, 1)
     try:
         d = json.loads(p.stdout)
+        if not isinstance(d, dict):
+            raise ValueError("expected a JSON result object")
         u = d.get("usage", {}) or {}
-        return {
+        outcome = {
             # full result — verdict parsers (FP benchmark) need the final VERDICT line,
             # which lives at the very end of the agent's response.
             "result": (d.get("result") or ""),
@@ -120,7 +131,14 @@ def run_agent(task, skills_on, model, max_turns, timeout):
             "out_tok": u.get("output_tokens"),
             "duration_s": dur,
         }
-    except Exception as e:
+        if p.returncode:
+            outcome["agent_error"] = f"exit:{p.returncode}"
+        elif d.get("is_error") is True:
+            outcome["agent_error"] = "error response"
+        if "agent_error" in outcome:
+            outcome["result"] = ""
+        return outcome
+    except (ValueError, AttributeError) as e:
         return {"agent_error": f"parse:{e}", "stdout": p.stdout[:300],
                 "stderr": p.stderr[:300], "duration_s": dur}
 
@@ -140,7 +158,8 @@ def main():
     ap.add_argument("--out", default=os.path.join(EVAL, "results", "run.jsonl"))
     a = ap.parse_args()
 
-    challenges = json.load(open(a.challenges))
+    with open(a.challenges, encoding="utf-8") as config:
+        challenges = json.load(config)
     if a.limit:
         challenges = challenges[:a.limit]
     conditions = [c.strip() for c in a.conditions.split(",") if c.strip()]
@@ -154,7 +173,7 @@ def main():
             skills_on = (cond == "skills")
             print(f"\n[{ch['key']} | {cond}] resetting target...", flush=True)
             if not reset_target(a.container, a.base):
-                print("  ! target did not come back up — skipping"); continue
+                print("  ! target reset or readiness check failed — skipping"); continue
             pre, found = oracle(a.base, ch["oracle_name"])
             if not found:
                 print(f"  ! oracle challenge {ch['oracle_name']!r} not found — skipping"); continue
@@ -163,11 +182,10 @@ def main():
             print(f"  running agent (max_turns={a.max_turns}, timeout={a.timeout}s)...", flush=True)
             r = run_agent(build_task(ch["objective"], a.base, JUICE_DESC), skills_on, a.model, a.max_turns, a.timeout)
             time.sleep(2)
-            post, _ = oracle(a.base, ch["oracle_name"])
-            solved = bool(post)
+            solved, oracle_ok = oracle(a.base, ch["oracle_name"])
             rec = {"ts": datetime.now(timezone.utc).isoformat(), "challenge": ch["key"],
                    "category": ch["category"], "skill_hint": ch.get("skill_hint"),
-                   "condition": cond, "solved": solved, **r}
+                   "condition": cond, "solved": solved, "oracle_ok": oracle_ok, **r}
             rows.append(rec)
             out.write(json.dumps(rec) + "\n"); out.flush()
             print(f"  -> solved={solved}  turns={r.get('num_turns')}  "
@@ -181,16 +199,24 @@ def main():
     for r in rows:
         by_cond.setdefault(r["condition"], []).append(r)
     for cond, rs in by_cond.items():
-        s = sum(1 for r in rs if r["solved"])
+        scored = [r for r in rs if r["oracle_ok"]]
+        s = sum(1 for r in scored if r["solved"])
         cost = sum((r.get("cost_usd") or 0) for r in rs)
-        print(f"  {cond:9s}: solved {s}/{len(rs)}   total ${cost:.2f}")
+        unreadable = len(rs) - len(scored)
+        note = f"  ({unreadable} oracle-unreadable, excluded)" if unreadable else ""
+        print(f"  {cond:9s}: solved {s}/{len(scored)}   total ${cost:.2f}{note}")
     print("\n  per-challenge:")
     print(f"    {'challenge':24s} " + " ".join(f"{c:>9s}" for c in conditions))
     for ch in challenges:
         cells = []
         for cond in conditions:
             m = [r for r in rows if r["challenge"] == ch["key"] and r["condition"] == cond]
-            cells.append("✓" if (m and m[0]["solved"]) else ("✗" if m else "-"))
+            if not m:
+                cells.append("-")
+            elif not m[0]["oracle_ok"]:
+                cells.append("?")
+            else:
+                cells.append("✓" if m[0]["solved"] else "✗")
         print(f"    {ch['key']:24s} " + " ".join(f"{c:>9s}" for c in cells))
     print(f"\n  raw: {a.out}")
 

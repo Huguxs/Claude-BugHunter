@@ -15,8 +15,8 @@ Stdlib only.
 import argparse
 import glob
 import os
-import re
 import sys
+from urllib.parse import urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -24,22 +24,37 @@ DISCLOSED = os.path.join(REPO, "docs", "disclosed-reports")
 
 sys.path.insert(0, HERE)
 import classify_reports as C  # noqa: E402
+from harvest_h1 import HACKERONE_REPORT_URL, report_ids  # noqa: E402
 
 
 def already_cited_ids():
-    """Report ids already referenced anywhere in docs/disclosed-reports/ (by URL or /reports/<id>)."""
+    """Report ids already referenced anywhere in docs/disclosed-reports/ (from HackerOne report URLs)."""
     ids = set()
     for f in glob.glob(os.path.join(DISCLOSED, "*.md")):
         try:
-            txt = open(f, encoding="utf-8").read()
+            with open(f, encoding="utf-8") as stream:
+                txt = stream.read()
         except OSError:
             continue
-        ids.update(re.findall(r"hackerone\.com/reports/(\d+)", txt))
+        ids.update(report_ids(txt))
     return ids
 
 
-def signal(r):
-    return (r.get("bounty") or 0), (r.get("votes") or 0)
+def hackerone_id(record):
+    """Return the HackerOne identity for explicitly sourced or legacy records."""
+    source = record.get("source")
+    if source:
+        return str(record.get("id")) if source == "hackerone" else None
+    try:
+        url = urlsplit(record.get("url") or "")
+    except (TypeError, ValueError):
+        return None
+    canonical = f"{url.scheme}://{url.netloc}{url.path.rstrip('/')}"
+    match = HACKERONE_REPORT_URL.fullmatch(canonical)
+    return match.group(1) if match else None
+
+
+signal = C.signal
 
 
 def main(argv):
@@ -51,7 +66,7 @@ def main(argv):
     cited = already_cited_ids()
     per_skill, unmapped = {}, []
     for r in recs:
-        if str(r.get("id")) in cited:
+        if hackerone_id(r) in cited:
             continue                      # already curated in
         skill = C.classify_one(r)
         (per_skill.setdefault(skill, []) if skill else unmapped).append(r)
@@ -75,7 +90,8 @@ def main(argv):
                          f"{(r.get('title') or '')[:70]} — {r.get('url')}")
         lines.append("")
 
-    open(a.out, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+    with open(a.out, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(lines) + "\n")
     print(f"report_coverage: {len(recs)} report(s) — {total_gaps} skill-mapped gap(s), "
           f"{len(unmapped)} new-technique candidate(s). Wrote {a.out}")
     return 1 if (total_gaps or unmapped) else 0

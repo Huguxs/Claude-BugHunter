@@ -21,7 +21,8 @@ Usage: python3 research/reports/verify_citations.py            # verify all
        python3 research/reports/verify_citations.py --skill hunt-saml
 Stdlib only.
 """
-import argparse, glob, json, os, re, sys, time
+import argparse, glob, json, os, sys, time
+from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import classify_reports as C
 import harvest_h1 as H
@@ -31,7 +32,9 @@ DR = os.path.join(ROOT, "docs", "disclosed-reports")
 RAW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raw")
 
 # citing-skill regex map (reuse the classifier's own rules, keyed by skill)
-SKILL_RX = {s: rx for s, rx in C.COMPILED}
+SKILL_RX = defaultdict(list)
+for skill, pattern in C.COMPILED:
+    SKILL_RX[skill].append(pattern)
 
 
 def citations():
@@ -39,19 +42,22 @@ def citations():
     m = {}
     for f in glob.glob(os.path.join(DR, "*.md")):
         skill = os.path.splitext(os.path.basename(f))[0]
-        for rid in re.findall(r'reports/(\d+)', open(f).read()):
-            m.setdefault(rid, set()).add(skill)
+        with open(f, encoding="utf-8") as stream:
+            for rid in H.report_ids(stream.read()):
+                m.setdefault(rid, set()).add(skill)
     return m
 
 
 def cached_title(rid):
-    for f in glob.glob(os.path.join(RAW, "**", f"{rid}.json"), recursive=True):
-        try:
-            r = json.load(open(f))
-            return r.get("title") or "", r.get("summary") or "", r.get("cwe") or ""
-        except Exception:
-            pass
-    return None
+    path = os.path.join(RAW, "h1", f"{rid}.json")
+    try:
+        with open(path, encoding="utf-8") as stream:
+            record = json.load(stream)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    return record.get("title") or "", record.get("summary") or "", record.get("cwe") or ""
 
 
 def main(argv):
@@ -81,8 +87,7 @@ def main(argv):
         for citing in sorted(cites[rid]):
             if a.skill and citing != a.skill:
                 continue
-            rx = SKILL_RX.get(citing)
-            self_match = bool(rx and rx.search(haystack))
+            self_match = any(rx.search(haystack) for rx in SKILL_RX.get(citing, ()))
             if not (title or summary):
                 verdict = "WEAK"; weak += 1
             elif self_match or content_skill == citing:
