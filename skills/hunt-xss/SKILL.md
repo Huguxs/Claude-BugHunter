@@ -2,7 +2,7 @@
 name: hunt-xss
 description: Hunting skill for xss vulnerabilities. Built from 174 public bug bounty reports. Use when hunting xss on any target. For markup injection that reflects raw HTML but does NOT execute JavaScript (no `<script>`/event-handler execution), see hunt-html-injection — escalate here once script execution is possible.
 sources: github, hackerone_public
-report_count: 174
+report_count: 175
 ---
 
 ## Autonomous Testing Priority
@@ -298,6 +298,7 @@ curl -sk "https://target.com/page" | grep -i "evil.com"
 **Sanitizer Bypasses:**
 - **mXSS (Mutation XSS):** Inject HTML that's safe when parsed by sanitizer but mutates when re-parsed by browser (e.g., `<math><style><img onerror=...>`)
 - **Tag combination attacks:** `<svg>` + `<style>` or `<math>` + `<style>` create parsing ambiguity
+- **No-equals-sign `innerHTML` execution via `<selectedcontent>` cloning:** when a sink filters/strips `=` (so attribute-based event handlers like `onerror=` are unusable) but still injects into `innerHTML`, try a `<select>`/`<option>`/`<selectedcontent>` structure with an `<svg><script>` inside the option. `<selectedcontent>` clones the selected `<option>`'s children using the same algorithm as `cloneNode(true)`; on some engines the clone leaves the "already started" flag `false` for an SVG-namespace `<script>` (unlike an HTML `<script>`, which the spec marks already-started and refuses to run), so the cloned SVG script executes even though it never ran in its original position. Requires no `=` character anywhere in the payload — only angle brackets and tag names. Browser-dependent (reported against a WebKit-based engine; confirm current behavior before relying on it, vendors patch this class quickly). Source: <https://portswigger.net/research/achieving-the-impossible-xss-in-innerhtml-without-equals>.
 - **Attribute quoting variations:** `onmouseover=alert(1)` without quotes, backtick delimiters
 - **HTML entity encoding:** `&#106;avascript:` or `&#x6A;avascript:` in href values
 - **Protocol variations:** `javascript:`, `vbscript:`, `data:text/html`
