@@ -1,8 +1,8 @@
 ---
 name: hunt-xss
-description: Hunting skill for xss vulnerabilities. Built from 174 public bug bounty reports. Use when hunting xss on any target. For markup injection that reflects raw HTML but does NOT execute JavaScript (no `<script>`/event-handler execution), see hunt-html-injection — escalate here once script execution is possible.
-sources: github, hackerone_public
-report_count: 174
+description: Hunting skill for xss vulnerabilities. Built from 176 public bug bounty reports plus PortSwigger research. Use when hunting xss on any target. For markup injection that reflects raw HTML but does NOT execute JavaScript (no `<script>`/event-handler execution), see hunt-html-injection — escalate here once script execution is possible.
+sources: github, hackerone_public, portswigger_research
+report_count: 176
 ---
 
 ## Autonomous Testing Priority
@@ -294,6 +294,8 @@ curl -sk "https://target.com/page" | grep -i "evil.com"
 - Use `<base>` tag injection to redirect script sources
 - Exploit `unsafe-eval` or `unsafe-inline` in style-src to execute CSS-based attacks
 - `<link rel=preload>` or `<meta http-equiv>` gadgets to bypass strict policies
+- **Even a "default-src 'none'" CSP can leak credentials without any script execution.** `form-action` does NOT inherit from `default-src` — it must be set explicitly, and most policies forget it. If you only have an HTML-injection sink (no script execution possible) under a strict CSP, inject a `<form>` whose `action` points back to the vulnerable page itself (self-POST satisfies `form-action 'self'`) with fields pre-filled to capture whatever the victim submits next (e.g. overlay a fake login form). On the reflected re-render, follow with a `<meta http-equiv="refresh">` redirect to an attacker domain (CSP does not restrict meta-refresh navigation) with `Referrer-Policy: unsafe-url`/no restriction, so the full URL including captured data reaches the attacker via the `Referer` header. Check every directive individually (`form-action`, `base-uri`) rather than assuming `default-src` covers them — this escalates a plain HTML-injection finding (see `hunt-html-injection`) into credential theft even when script-src is airtight. Source: <https://portswigger.net/research/blind-trust-stealing-credentials-through-csp>.
+- **"Impossible" equals-free / attribute-free innerHTML XSS.** When a sink inserts untrusted markup via `innerHTML` and strips or disallows the `=` character (blocking all attributes/event handlers), check whether the target's browser supports `<selectedcontent>` (a `<select>`-mirroring element that clones the selected `<option>`'s children, `cloneNode`-style, on insertion). A `<script>` element built in the **SVG namespace** (wrapped in `<svg>`) does not get the "already started" flag that normally blocks scripts inserted via `innerHTML` — so when `<selectedcontent>` clones it out of a default-selected `<option>`, the cloned SVG `<script>` executes with zero `=` characters anywhere in the payload. Works in Safari at time of writing; patched in Chromium after disclosure — always test cross-engine since a fix in one browser doesn't propagate to others. Treat any "impossible due to missing character X" filter claim as provisional. Source: <https://portswigger.net/research/achieving-the-impossible-xss-in-innerhtml-without-equals>.
 
 **Sanitizer Bypasses:**
 - **mXSS (Mutation XSS):** Inject HTML that's safe when parsed by sanitizer but mutates when re-parsed by browser (e.g., `<math><style><img onerror=...>`)
