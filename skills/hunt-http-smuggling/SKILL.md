@@ -2,7 +2,7 @@
 name: hunt-http-smuggling
 description: "Hunt HTTP request smuggling (CL.TE, TE.CL, H2.CL, H2.TE). Cause: front-end proxy and back-end server disagree on where one request ends and the next begins (Content-Length vs Transfer-Encoding header parsing inconsistency). CL.TE: front-end uses CL, back uses TE → smuggle by sending TE: chunked but with body that fits CL count. TE.CL: opposite. H2.CL: HTTP/2 downgrade, smuggle CL into HTTP/1.1 back-end. Detection tools: Burp HTTP Request Smuggler extension, smuggler.py, h2csmuggler. Confirm: time-delay technique (smuggled GET with 30s timeout) — if front-end returns slow on next victim request, smuggling works. Validate: cache poisoning chain (smuggle request that gets cached for victim), credential theft (smuggle X-Forwarded-For override that captures next user's cookies), bypass auth (smuggled internal-path request). Real paid examples from major CDN deployments. Use when hunting H1 paid programs running CDN+origin stacks, when targeting load balancer / WAF bypass."
 sources: hackerone_public, cve_database, portswigger_research, public_research
-report_count: 12
+report_count: 13
 ---
 
 ## 17. HTTP REQUEST SMUGGLING
@@ -69,6 +69,19 @@ curl -sI https://target/ | grep -i "Server:"
 H2-downgrade smuggling attacks rely on the front-end speaking HTTP/2 to the client and HTTP/1.1 to origin. The downgrade introduces CL/TE confusion because HTTP/2's frame-length headers don't survive the conversion cleanly. Most CDN+origin chains in 2024-2026 use this exact topology.
 
 Tools that send HTTP/2 raw frames (Burp Pro's HTTP Request Smuggler extension, `h2csmuggler`, `smuggler.py`) are the right starting point against CDN-fronted targets. Avoid HTTP/1.1-only test clients (curl, raw sockets) against H2-front-ended targets — you'll send the wrong protocol entirely.
+
+### CRLF header injection → desync (no CL/TE mismatch required)
+
+A plain CRLF/header-injection bug (an injected header value, or any other insertion point that lets you smuggle a line break into the request the front-end forwards upstream) can be escalated into a full desync even without a classic CL.TE/TE.CL content-length mismatch. Four-phase methodology (PortSwigger, "CRLF-Powered Desync Attacks," Aug 2026 — now packaged as Burp AI/Agent "AT skills"):
+
+1. **Locate the injection relative to the Host header.** Probe whether your injected line lands *before* or *after* the upstream `Host:` header — the differing response status codes between probes tell you which side you landed on, which determines what you can forge.
+2. **Validate a desync, not just an injection.** Fuzz split-style request prefixes through the injection point until you get **2–3 distinct response status codes** across repeated requests — that divergence is the signal the backend is now parsing the request stream differently than the front-end intended, not just reflecting your header.
+3. **Find an exploit gadget on the target.** Crawl for an open redirect that builds its `Location` from `Host`, `X-Forwarded-Host`, or any absolute-URL input the attacker's injected request line can control.
+4. **Chain injection + desync + gadget.** The validated desync smuggles a request that pairs with the next victim's connection; combined with the redirect gadget, the victim's real request gets answered with a redirect to an attacker domain. Repeat across multiple connections to confirm it's not a one-off race.
+- **Escalation ceiling:** chained with cache poisoning (see `hunt-cache-poison`), this reaches full-site takeover, not just a one-off redirect.
+- **Fallback if no full desync:** try "blind request tunnelling" for an access-control-bypass primitive instead of abandoning the finding — a partial desync that doesn't give you response-queue control can still smuggle a request path past a front-end ACL.
+- **Takeaway for triage:** don't dismiss a bare CRLF/header-injection finding as "just a header injection, low impact" — always run the 4-phase desync-validation check before writing it up as informational.
+- Source: https://portswigger.net/research/crlf-powered-desync-attacks
 
 ### Mass credential harvesting — the "collector gadget"
 The highest-impact smuggling outcome needs no per-victim interaction. Instead of blindly poisoning the queue, smuggle a request aimed at a **back-end handler that echoes the full request** — a search endpoint that reflects headers, or a redirect that mirrors the request line. The next victim's headers (`Cookie`, `Authorization`, `X-Access-Token`) get attributed to your smuggled request, and the reflecting handler returns them **in a response you read**. Repeated on a busy keep-alive socket, this harvests live credentials from arbitrary users at scale — and it works even through a CDN (Akamai/Cloudflare) when the CDN↔origin hop desyncs. Chains to `hunt-ato`.

@@ -2,7 +2,7 @@
 name: hunt-xss
 description: Hunting skill for xss vulnerabilities. Built from 174 public bug bounty reports. Use when hunting xss on any target. For markup injection that reflects raw HTML but does NOT execute JavaScript (no `<script>`/event-handler execution), see hunt-html-injection — escalate here once script execution is possible.
 sources: github, hackerone_public
-report_count: 174
+report_count: 175
 ---
 
 ## Autonomous Testing Priority
@@ -294,6 +294,7 @@ curl -sk "https://target.com/page" | grep -i "evil.com"
 - Use `<base>` tag injection to redirect script sources
 - Exploit `unsafe-eval` or `unsafe-inline` in style-src to execute CSS-based attacks
 - `<link rel=preload>` or `<meta http-equiv>` gadgets to bypass strict policies
+- **No script needed at all:** if the injection is pure HTML (no script execution achievable), check whether `form-action` is unset or `'self'` — a same-origin `<form>` + `<meta refresh>`/`unsafe-url` referrer chain can still exfiltrate submitted credentials under a CSP that blocks every script source. See `hunt-html-injection` → *Credential Theft Through HTML Injection Even Under a Strict CSP* for the full chain.
 
 **Sanitizer Bypasses:**
 - **mXSS (Mutation XSS):** Inject HTML that's safe when parsed by sanitizer but mutates when re-parsed by browser (e.g., `<math><style><img onerror=...>`)
@@ -345,6 +346,14 @@ curl -sk "https://target.com/page" | grep -i "evil.com"
     - `PARAM` = the reflected parameter you found.
     - `CODES` = the comma-separated character codes of the JavaScript you want to run — **compute these yourself** (e.g. encode `x=alert(1)` by converting each character to its char code). `toString()` produces a string without quotes; `[].join` replaces `charAt`; `orderBy` invokes the filter; `fromCharCode(CODES)` rebuilds your payload from the codes.
 - Applies to **legacy AngularJS (<1.6)** only; modern frameworks (Angular 2+, React, Vue) are not affected.
+
+**`innerHTML` XSS with no `=` character (character-filter bypass via `<selectedcontent>` cloning):**
+- *When to try:* the sink is `innerHTML` (or equivalent DOM-cloning context) and the app/WAF strips or blocks `=`, so standard attribute payloads (`onerror=`, `src=`) are dead — you need an all-no-equals, no-attribute vector.
+- *Mechanism:* the `<selectedcontent>` element mirrors the child nodes of a `<select>`'s currently-selected `<option>` (first option is selected by default if none has `selected`). When the mirrored content includes an SVG `<script>`, the *clone* created by `<selectedcontent>` was found (pre-patch Chromium, and still in some Safari builds) to NOT carry the HTML spec's "already started" flag that normally stops scripts inserted via `innerHTML` from executing — so the cloned SVG script runs even though the original, directly-inserted script would not.
+- *Payload shape (fill in your own JS, no literal payload below):* a `<select>` containing a `<selectedcontent>` element and an `<option>` whose child is an SVG-namespaced `<script>` — no `=` needed anywhere in the markup; a `<button>` variant inside `<selectedcontent>` additionally avoids `/` and whitespace if those are filtered too.
+- *Browser scope:* test in both Chrome and Safari — this is a parser-quirk race between browser engines and HTML-spec hardening, so confirm per-target browser rather than assuming cross-browser portability. Chromium patched the already-started flag for SVG scripts; Safari was still exploitable at disclosure time.
+- *Lesson for defenders / graders:* never treat character-blocklisting (no `=`, no `/`, no space) as a sufficient XSS control — note this explicitly when writing up a "WAF blocks standard payloads" finding, since graders should test DOM-clone sinks (`<select>`/`<selectedcontent>`, `<template>`, custom elements) before concluding a sink is safe.
+- Source: https://portswigger.net/research/achieving-the-impossible-xss-in-innerhtml-without-equals (Masato Kinugawa, PortSwigger Research, Nov 2026).
 
 ---
 
