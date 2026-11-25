@@ -2,7 +2,7 @@
 name: hunt-http-smuggling
 description: "Hunt HTTP request smuggling (CL.TE, TE.CL, H2.CL, H2.TE). Cause: front-end proxy and back-end server disagree on where one request ends and the next begins (Content-Length vs Transfer-Encoding header parsing inconsistency). CL.TE: front-end uses CL, back uses TE → smuggle by sending TE: chunked but with body that fits CL count. TE.CL: opposite. H2.CL: HTTP/2 downgrade, smuggle CL into HTTP/1.1 back-end. Detection tools: Burp HTTP Request Smuggler extension, smuggler.py, h2csmuggler. Confirm: time-delay technique (smuggled GET with 30s timeout) — if front-end returns slow on next victim request, smuggling works. Validate: cache poisoning chain (smuggle request that gets cached for victim), credential theft (smuggle X-Forwarded-For override that captures next user's cookies), bypass auth (smuggled internal-path request). Real paid examples from major CDN deployments. Use when hunting H1 paid programs running CDN+origin stacks, when targeting load balancer / WAF bypass."
 sources: hackerone_public, cve_database, portswigger_research, public_research
-report_count: 12
+report_count: 13
 ---
 
 ## 17. HTTP REQUEST SMUGGLING
@@ -69,6 +69,14 @@ curl -sI https://target/ | grep -i "Server:"
 H2-downgrade smuggling attacks rely on the front-end speaking HTTP/2 to the client and HTTP/1.1 to origin. The downgrade introduces CL/TE confusion because HTTP/2's frame-length headers don't survive the conversion cleanly. Most CDN+origin chains in 2024-2026 use this exact topology.
 
 Tools that send HTTP/2 raw frames (Burp Pro's HTTP Request Smuggler extension, `h2csmuggler`, `smuggler.py`) are the right starting point against CDN-fronted targets. Avoid HTTP/1.1-only test clients (curl, raw sockets) against H2-front-ended targets — you'll send the wrong protocol entirely.
+
+### CRLF-in-a-reflected-header as a desync primitive (no CL/TE needed)
+Not every desync starts from a CL/TE mismatch — a plain CRLF-injection flaw into ANY value the front-end/CDN reflects into the request it forwards upstream (a path segment that gets rewritten into a custom header, a query param copied into an upstream header, etc.) can be just as exploitable if the line breaks aren't sanitized before the proxy hop:
+1. **Find the reflection point and probe for line-break injection** — vary where your `\r\n` sequence lands relative to the real `Host` header the proxy forwards, and watch for distinct status codes as you shift the split point; 2–3 different status codes from otherwise-identical requests confirms the upstream is parsing your injected bytes as new header/request boundaries, not literal text.
+2. **Use the break to start a smuggled second request inside the same upstream connection** — same mechanics as classic request smuggling, except the entry point is an unsanitized CRLF in a reflected value rather than a CL/TE header mismatch.
+3. **Find a gadget that trusts the smuggled request's `Host`/`X-Forwarded-Host`** — a common one is a path that 301/302-redirects to its trailing-slash form using the Host value. Because the attacker controls the Host of the *smuggled* request, the generated redirect points wherever they choose.
+4. **Confirm against a different client/session** — fire the validated split+gadget combo repeatedly over separate connections and check whether an unrelated concurrent request receives the attacker-chosen redirect; that's the proof, not a timing delta observed in your own browser.
+Even without a usable redirect gadget this is still a reportable, validated desync. Chaining this primitive with `hunt-cache-poison` turns a single-victim redirect into a response served to everyone until the cache entry expires. Source: PortSwigger Research, "Making HTTP header injection critical with one prompt" — <https://portswigger.net/research/making-http-header-injection-critical-with-one-prompt>.
 
 ### Mass credential harvesting — the "collector gadget"
 The highest-impact smuggling outcome needs no per-victim interaction. Instead of blindly poisoning the queue, smuggle a request aimed at a **back-end handler that echoes the full request** — a search endpoint that reflects headers, or a redirect that mirrors the request line. The next victim's headers (`Cookie`, `Authorization`, `X-Access-Token`) get attributed to your smuggled request, and the reflecting handler returns them **in a response you read**. Repeated on a busy keep-alive socket, this harvests live credentials from arbitrary users at scale — and it works even through a CDN (Akamai/Cloudflare) when the CDN↔origin hop desyncs. Chains to `hunt-ato`.
