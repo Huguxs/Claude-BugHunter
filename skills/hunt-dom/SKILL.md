@@ -2,7 +2,7 @@
 name: hunt-dom
 description: "Hunt client-side DOM vulnerabilities — classic DOM XSS (source → sink), DOM Clobbering (overwrite JS globals via HTML injection), PostMessage hijacking (missing origin check), Service Worker abuse (intercept requests from same-origin script), CSS Injection/Exfiltration (attribute selectors → token char-by-char via OOB), client-side template injection, dangerouslySetInnerHTML. Grounded in named public research: Gareth Heyes / PortSwigger DOM-clobbering + DOM-Invader, Michał Bentkowski DOMPurify clobbering bypasses, jQuery htmlPrefilter XSS (CVE-2020-11022 / CVE-2020-11023), d0nut CSS-exfil research, plus disclosed HackerOne DOM-XSS reports and public WAF-bypass corpora. Use when hunting DOM-XSS, client-side auth bypass, or token exfiltration without server-side interaction, including behind a WAF."
 sources: portswigger_research, hackerone_public, github_security_advisories
-report_count: 16
+report_count: 17
 ---
 
 # HUNT-DOM — DOM Clobbering / PostMessage / Service Worker / CSS Exfil
@@ -112,6 +112,9 @@ data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==   <!-- base64-wrapped
 ```
 
 > Validate each bypass against the *live* filter, don't assume from the list — a signature that stops `<script>` case-insensitively will still eat `<sCrIpT>`; test iteratively and check the browser console for what actually parsed vs what the WAF actually blocked (403/406 vs silently stripped). Reference corpora for further variants: PortSwigger XSS cheat sheet, PayloadsAllTheThings XSS, OWASP XSS filter evasion.
+
+### New-HTML-feature mutation sink: `<selectedcontent>` cloning scripts into execution
+Don't assume "`<script>` inserted via `innerHTML` never runs" covers every path — some browsers' handling of the newer `<select>`/`<selectedcontent>` mirroring feature breaks that assumption. `<selectedcontent>` is a live mirror of the currently-selected `<option>`: the browser deep-clones that option's child nodes into it (same algorithm as `cloneNode(true)`). A `<script>` element inserted via `innerHTML` is normally flagged "already started" so the clone stays inert — but when the original script is in the **SVG namespace** rather than HTML, some Chromium/WebKit builds didn't carry that flag onto the SVG script, so its clone inside `<selectedcontent>` runs as a fresh element. Both conditions are required (SVG namespace + the `<selectedcontent>` clone path); either alone stays inert. Test when you have an `innerHTML`-only sink and every `<script>`/event-handler probe is swallowed: try an SVG-namespaced script nested inside a `<select><option>` with a sibling empty `<selectedcontent>`, with no `=`, whitespace, or `/` if the filter is character-restrictive — this is browser- and version-dependent (reported against recent Chromium and Safari builds; Chrome's handling later changed), so confirm directly in the target's actual rendering engine rather than assuming it works. Lesson for defenders/triage: sanitizers must account for *any* DOM API that clones or mirrors content between nodes, not just the sink that received attacker input directly. Source: PortSwigger Research, "Achieving the impossible: XSS in innerHTML without equals" — <https://portswigger.net/research/achieving-the-impossible-xss-in-innerhtml-without-equals>.
 
 ### Validation rule for classic DOM XSS
 The payload must execute in the browser and must not be present (or only HTML-encoded) in the server response body. If it's echoed unescaped server-side too, downgrade/relabel as reflected XSS, not DOM XSS — the two have different remediation paths and you don't want a triager bouncing the report over a misclassification.

