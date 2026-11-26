@@ -2,7 +2,7 @@
 name: hunt-html-injection
 description: "Hunt HTML Injection — user-supplied input is rendered as raw HTML in the response without sanitisation, allowing an attacker to inject arbitrary HTML tags (but not necessarily JavaScript). Lower severity than XSS but enables phishing, UI manipulation, and credential harvesting via injected forms. Use when testing text-display surfaces (search results, profile fields, comments, error messages, feedback forms). For markup that executes JavaScript, escalate to hunt-xss."
 sources: hackerone_public, public_research
-report_count: 6
+report_count: 7
 ---
 
 ## What is HTML Injection
@@ -60,3 +60,7 @@ Confirmed when your injected tag appears in the response body with literal `<` a
 - XSS: `<script>alert(1)</script>` executes JavaScript.
 
 Some WAFs block `<script>` but pass `<b>` or `<img>` — start with non-script tags, then escalate.
+
+## Form injection beats a strict CSP
+
+A CSP of `default-src 'none'` with no explicit `form-action` directive, or `form-action 'self'`, still lets an injected `<form>` submit — `form-action` does not inherit from `default-src`. If HTML injection lets you add form fields, the victim's own browser (not any script you control) can carry their typed input to wherever the form posts, and a follow-on reflected value in the same parameter can set page behavior (e.g. a looser referrer policy or a redirect meta tag) that forwards the full URL — including query-string data — to an attacker-controlled host. CSP does not govern navigation or the `Referer` header, so this chain needs no JavaScript execution at all and survives a CSP that would block every XSS vector. When reviewing a strict CSP, always check `form-action` explicitly rather than assuming `default-src` covers it, and check the app's `Referrer-Policy`. Cross-ref: `hunt-xss`, `hunt-ato`. Source: PortSwigger Research, "Blind trust: stealing credentials through CSP" (2026-11-11), https://portswigger.net/research/blind-trust-stealing-credentials-through-csp
