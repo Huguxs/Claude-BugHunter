@@ -1,8 +1,8 @@
 ---
 name: hunt-xss
-description: Hunting skill for xss vulnerabilities. Built from 174 public bug bounty reports. Use when hunting xss on any target. For markup injection that reflects raw HTML but does NOT execute JavaScript (no `<script>`/event-handler execution), see hunt-html-injection — escalate here once script execution is possible.
+description: Hunting skill for xss vulnerabilities. Built from 175 public bug bounty reports/research writeups. Use when hunting xss on any target. For markup injection that reflects raw HTML but does NOT execute JavaScript (no `<script>`/event-handler execution), see hunt-html-injection — escalate here once script execution is possible.
 sources: github, hackerone_public
-report_count: 174
+report_count: 175
 ---
 
 ## Autonomous Testing Priority
@@ -202,6 +202,9 @@ aaa"bbb'ccc<ddd>eee`fff
   <script>alert(document.domain)</script>
 </svg>
 ```
+
+**`innerHTML`-only sink with `=` filtered (no `<script>` execution, engine-specific):**
+When injection lands only in a value later assigned to `.innerHTML` (so a plain `<script>` tag stays inert) and the filter strips/blocks the `=` character — ruling out most attribute-based event-handler payloads — try forcing a node clone across the HTML/SVG namespace boundary: wrap an inert `<svg><script>…</script></svg>` inside the first `<option>` of a `<select>`, with an empty `<selectedcontent>` sibling. Because a `<select>` auto-selects its first `<option>` with no `selected` attribute needed, `<selectedcontent>` (a newer form-associated element) clones that option's child nodes — including the SVG script — into itself at parse time. The clone lands in the HTML namespace without carrying the "already started" flag some engines set only on the original HTML-created script, so the *cloned* script executes even though the original SVG one never would. No `=` is required anywhere in the payload. Browser-dependent and fragile — confirmed by the author in Safari 27.2 and pre-153 Chrome; patched in current Chromium, so always verify live in the actual target browser rather than assuming it works. Source: Masato Kinugawa via PortSwigger Research, "Achieving the impossible: XSS in innerHTML without equals" (2026-11-18), <https://portswigger.net/research/achieving-the-impossible-xss-in-innerhtml-without-equals>.
 
 **Sanitizer bypass — math+style combo:**
 ```html

