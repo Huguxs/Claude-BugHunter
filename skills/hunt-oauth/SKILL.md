@@ -2,7 +2,7 @@
 name: hunt-oauth
 description: Hunting skill for oauth vulnerabilities. Built from 19 public bug bounty reports. Use when hunting oauth on any target.
 sources: github, hackerone_public, salt_labs, descope, detectify_labs, harel_research
-report_count: 22
+report_count: 23
 ---
 
 ## Crown Jewel Targets
@@ -401,6 +401,18 @@ A server-side prefix-match flaw on `redirect_uri` is **necessary but not suffici
 **Operational rule:** the WHATWG URL parser (used by all modern browsers since 2018) does userinfo parsing ONLY in the authority section — i.e., **before the first `/` after `://`**. Once the path begins, `@` is just a character. Server-side string-startswith checks don't model this — they pass URLs the browser will then route to the legitimate host.
 
 **Always headless-test (Playwright / Puppeteer / a real browser) the final navigation BEFORE writing the OAuth finding as ATO-chain.** Server-side accept + browser-side stay-on-legitimate-host = **not** ATO. Verified live in `docs/verification/phase3-playwright-browser-execution.md` Test 29.
+
+---
+
+## Hostname-only `redirect_uri` validation: parser differentials (2026)
+
+When the provider validates only `new URL(redirect_uri).hostname`, scheme, path, query and fragment are attacker-controlled. Two ways the code still leaks (source: https://blog.voorivex.team/is-hostname-validation-enough-unusual-oauth-attack-vectors):
+
+- **Backslash differential:** WHATWG (Node, `new URL()`) ends the host at `\`; RFC 3986 parsers (e.g. Safari handling a `Location` header) do not. `https://legit.example\@attacker.example/cb` passes the server check as `legit.example`, but an RFC-3986 client sends the code to `attacker.example`. Test per browser; confirm the final navigation (see table above).
+- **Android intent fallback:** if `state` is echoed after the code (even encoded, via an `S.browser_fallback_url` delimiter split between `redirect_uri` and `state`), Chrome on Android can be steered to an attacker host with no app installed on the victim.
+- Also try non-http schemes (`android-app://`) when only the host is checked.
+
+Validate: redeem the stolen code; a callback that merely stays on the legit host is not ATO.
 
 ---
 

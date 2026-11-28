@@ -65,3 +65,20 @@ finding — that's correct handling. Disclosure of internal structure is.
   that's the evidence. "It returned 500" alone is not disclosure.
 - Note what the leak enables next (e.g. a disclosed SQL error → hunt-sqli; a
   disclosed absolute path → hunt-lfi).
+
+## Fail-open on resource exhaustion (setup / installer state)
+
+A transient failure of a dependency can flip a security-relevant state. Pattern
+(source: https://www.slcyber.io/research/fail2install-system-limits-pre-auth-rce-drupal):
+an installer decides "already installed?" from DB checks; one check errors out
+and the other swallows its exception, leaving the default `installed=false`, so
+the setup flow reopens on a live site.
+
+- Signals: `catch` blocks that ignore errors while deciding install/auth state;
+  `/install`, `/setup`, `/admin/install` endpoints that exist on production.
+- Trigger the failure with system limits: DB `max_connections`, ephemeral port
+  exhaustion (TIME_WAIT) on small PHP-FPM pools, slow endpoints holding sockets.
+- Impact comes from what setup accepts (e.g. a DB file path with an executable
+  extension → code in webroot). Only test with explicit program authorization:
+  exhaustion is DoS-adjacent; prefer the code-review/staging route.
+- Hand off: file-write to RCE → `hunt-rce`; webroot rules → `hunt-403-bypass`.

@@ -2,7 +2,7 @@
 name: hunt-cache-poison
 description: Hunting skill for cache poison vulnerabilities. Built from 10 public bug bounty reports including X-Forwarded-Host poisoning, X-HTTP-Method-Override / GCS cache, reflected→stored XSS via cache, classic Omer-Gil Web Cache Deception, Cloudflare Cache Deception Armor bypass, session-token cache deception, Akamai hop-by-hop smuggling → server-side edge poisoning, and Kettle's 2024 path-normalization WCD against Cloudflare/Fastly/GCP. Host/X-Forwarded-Host injection that reaches app logic (reset-link poisoning, routing SSRF, OAuth issuer) is owned by hunt-host-header; this skill owns the case where the poisoned response is CACHED and served to other users. Use when hunting cache poisoning, Web Cache Deception, CDN-fronted apps.
 sources: github, hackerone_public, portswigger_research, omergil_research, youstin_research
-report_count: 8
+report_count: 9
 ---
 
 ## Crown Jewel Targets
@@ -326,6 +326,14 @@ The following real, verified bug-bounty / coordinated-disclosure cases extend th
     - Payload: origin-vs-cache delimiter/normalization disagreements (e.g. encoded path segments and static-suffix tricks) that cause the cache to store a dynamic/authenticated response under a static-looking key
     - Root cause: cache and origin disagree on how to normalize/parse the URL path, so the cache key does not match the resource the origin actually served
     - Year: 2024 — coordinated CDN-vendor disclosure; methodology research (no single bounty), PortSwigger Top-10 Web Hacking Techniques 2024 entry
+
+---
+
+## Header-stripping via `Cache-Control: no-cache="<field>"` (2026)
+
+Source: https://www.slcyber.io/research/cache-me-if-you-can-xss-in-cloudflares-cdn-cgi-image
+
+Chromium honors the field list in `no-cache="X"` for ANY header when reusing a cached copy. If an image/asset proxy forwards origin `Cache-Control`, the attacker controls which headers (CSP, `Content-Type`) are dropped on the cached reuse. A body blocked by CSP on first load can run on a back-navigation served from the HTTP disk cache (an `opener` reference makes the page bfcache-ineligible). Dropping `Content-Type` enables MIME sniffing (SVG with doctype sniffed as HTML; sanitizers that skip processing instructions miss it). Also check: signed S3-style URLs allowing response-header overrides behind CNAMEs; redirects not re-checked against a source allowlist. Cross-ref `hunt-xss`, `hunt-file-upload`.
 
 ---
 
